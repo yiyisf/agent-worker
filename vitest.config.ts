@@ -12,10 +12,11 @@ export default defineConfig({
       '@ca/testing': r('./packages/testing/src/index.ts'),
       '@ca/memory': r('./packages/memory/src/index.ts'),
       '@ca/conductor': r('./packages/conductor/src/index.ts'),
+      '@ca/engine-ai-sdk': r('./packages/engine-ai-sdk/src/index.ts'),
     },
   },
   test: {
-    include: ['packages/*/src/**/*.test.ts'],
+    include: ['packages/*/src/**/*.test.ts', 'examples/*/src/**/*.test.ts'],
     environment: 'node',
   },
 });

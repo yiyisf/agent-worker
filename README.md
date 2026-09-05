@@ -7,7 +7,7 @@
 - **执行模式**：Worker 内闭环 —— 一个 Conductor task = 一次完整 Agent 运行，循环跑在 **worker 进程内**
 - **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
-- **当前状态**：M0，架构设计与目录骨架（v0.4）。代码为契约声明，尚无实现。
+- **当前状态**：**M1 代码完成**（v0.6 设计）。88 个离线测试通过；端到端验证待真机执行，见 [docs/verification.md](docs/verification.md)
 
 ## 这个 SDK 做什么、不做什么
 
@@ -109,6 +109,7 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 | [§10.4 进展反馈](docs/architecture.md#104-进展反馈让编排引擎在运行中就知道进度) | 运行中的进展同步回编排引擎（不是实时输出流） |
 | [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条 |
 | [docs/adr/](docs/adr/) | 18 条决策记录（含 3 条被后续推翻、2 条被修订的） |
+| [docs/verification.md](docs/verification.md) | M1 端到端验证清单：命令、预期输出、通过标准 |
 
 ## 仓库结构
 
@@ -120,7 +121,7 @@ examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
 
 ## 路线图
 
-**M1** 最小可用（core 契约 + 受管入口 + journal + callback + engine-ai-sdk，跑通 3.21.21）
+**M1** ✅ 代码完成（core + engine-ai-sdk + redis StateStore + Conductor 桥接 + 进展反馈 + 示例）
 → **M2** 可靠性（fencing + 三类测试 + **引擎一致性套件**）
 → **M3** 多引擎（harness 能力降级 + custom + 能力校验）
 → **M4** 配置化与领域定制 → **M5** HITL 与生态 → **M6** 生产化
@@ -140,7 +141,7 @@ M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把�
 ```bash
 pnpm install
 pnpm build          # 包之间按拓扑顺序构建；子包 typecheck 依赖 core 的构建产物
-pnpm test           # 88 个测试
+pnpm test           # 91 个测试（无 Redis / Conductor 时自动跳过需要它们的用例）
 
 # 需要 Redis 的用例（StateStore 契约、Worker 执行、进展端到端）
 # 没有 Redis 时会**跳过而不是失败** —— 纯逻辑部分任何机器上都能跑
@@ -149,6 +150,16 @@ pnpm test
 ```
 
 `CA_TEST_REDIS_URL` 可覆盖默认的 `redis://127.0.0.1:6380`。
+
+跑端到端（需要 docker daemon）：
+
+```bash
+docker compose -f examples/minimal-agent/docker-compose.yml up -d
+CONDUCTOR_SERVER_URL=http://localhost:8080/api pnpm test
+pnpm --filter @ca-example/minimal-agent start   # 手动跑一次并看输出
+```
+
+完整的验证清单与通过标准见 **[docs/verification.md](docs/verification.md)**。
 
 ## 文档校验
 
