@@ -135,6 +135,21 @@ M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把�
 不适合进 worker 运行时依赖。将来若需要**运行观测台 / 人工审批界面**，
 独立为 `@ca/console` 应用，通过 StreamSink 与 StateStore 读取，与 worker 运行时解耦。
 
+## 本地开发
+
+```bash
+pnpm install
+pnpm build          # 包之间按拓扑顺序构建；子包 typecheck 依赖 core 的构建产物
+pnpm test           # 88 个测试
+
+# 需要 Redis 的用例（StateStore 契约、Worker 执行、进展端到端）
+# 没有 Redis 时会**跳过而不是失败** —— 纯逻辑部分任何机器上都能跑
+redis-server --port 6380 --daemonize yes --save '' --appendonly no
+pnpm test
+```
+
+`CA_TEST_REDIS_URL` 可覆盖默认的 `redis://127.0.0.1:6380`。
+
 ## 文档校验
 
 架构图是 mermaid，肉眼评审抓不住语法问题（`subgraph` 标题含全角括号必须加引号）。

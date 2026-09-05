@@ -21,12 +21,34 @@ import {
 
 const REDIS_URL = process.env.CA_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380';
 const clients: Redis[] = [];
-async function redisStore(): Promise<RedisStateStore> {
+
+const newClient = (): Redis => {
   const c = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1, retryStrategy: () => null });
   clients.push(c);
+  return c;
+};
+
+/**
+ * 需要 Redis 的用例在没有 Redis 时**跳过而不是失败** ——
+ * 纯逻辑部分（TaskDef 推导、结果映射、取消检测）任何机器上都该能跑。
+ * 本地起一个：redis-server --port 6380 --daemonize yes --save '' --appendonly no
+ */
+let redisReachable = false;
+try {
+  const probe = newClient();
+  await probe.connect();
+  await probe.ping();
+  redisReachable = true;
+} catch {
+  redisReachable = false;
+}
+
+async function redisStore(): Promise<RedisStateStore> {
+  const c = newClient();
   await c.connect();
   return new RedisStateStore({ client: c as unknown as RedisLike, prefix: `ca-bridge-${Date.now()}` });
 }
+
 afterAll(async () => {
   await Promise.allSettled(clients.map((c) => c.quit()));
 });
@@ -261,14 +283,14 @@ describe('结果映射（§6.2）', () => {
   });
 });
 
-describe('Worker 编译与执行', () => {
+describe('Worker 编译（不需要 Redis）', () => {
   it('runKey 由 resumePolicy 决定 epoch（§5.2）', () => {
     const t = task({ retryCount: 3 });
     expect(runKeyOf(spec(), t)).toBe('wf-1:agent_ref:0');
     expect(runKeyOf(spec({ conductor: { resumePolicy: 'fresh-per-retry' } }), t)).toBe('wf-1:agent_ref:3');
   });
 
-  it('callback 策略 + 内存 StateStore → 启动即拒绝', async () => {
+  it('callback 策略 + 内存 StateStore → 启动即拒绝', () => {
     expect(() =>
       compileAgentWorker(spec(), {
         engines: [fakeEngine(1, { n: 0 })],
@@ -276,6 +298,9 @@ describe('Worker 编译与执行', () => {
       }),
     ).toThrow(/持久化 StateStore/);
   });
+});
+
+describe.skipIf(!redisReachable)('Worker 执行（需要 Redis）', () => {
 
   it('引擎未注册 → 启动即拒绝', async () => {
     const store = await redisStore();
@@ -369,5 +394,68 @@ describe('取消检测（§6.4）', () => {
       },
     });
     expect(await isWorkflowCancelled('wf-2')).toBe(false);
+  });
+});
+
+describe.skipIf(!redisReachable)('进展反馈接进 worker（需要 Redis，§10.4 / ADR-0018）', () => {
+  it('权威通道：outputData.progress 随分片交还一起写出，零额外请求', async () => {
+    const store = await redisStore();
+    const worker = compileAgentWorker(spec(), {
+      engines: [fakeEngine(2, { n: 0 })],
+      stateStore: store,
+      progress: { intervalMs: 0 },
+    });
+    const t = task();
+
+    const first = await worker.execute(t);
+    expect(first.status).toBe('IN_PROGRESS');
+    const p = first.outputData?.progress as { step: number; usage: { tokens: number } };
+    expect(p.step).toBeGreaterThan(0);
+    expect(p.usage.tokens).toBe(15);
+
+    const second = await worker.execute(t);
+    expect((second.outputData?.progress as { step: number }).step).toBeGreaterThanOrEqual(p.step);
+  });
+
+  it('尽力而为通道：进展写进 task log，且单次不超过 10 条', async () => {
+    const batches: string[][] = [];
+    const worker = compileAgentWorker(spec(), {
+      engines: [fakeEngine(1, { n: 0 })],
+      stateStore: await redisStore(),
+      progress: { intervalMs: 0 },
+      taskLogSink: () => ({ addLogs: (lines) => void batches.push(lines) }),
+    });
+    await worker.execute(task());
+    expect(batches.length).toBeGreaterThan(0);
+    for (const b of batches) expect(b.length).toBeLessThanOrEqual(10);
+    // 日志是给人看的一行文本，不该是 payload
+    expect(batches.flat().every((l) => typeof l === 'string' && l.length <= 512)).toBe(true);
+  });
+
+  it('跨 taskId 重试时补一条续接摘要，把断档接上', async () => {
+    const store = await redisStore();
+    const lines: string[] = [];
+    const worker = compileAgentWorker(spec(), {
+      engines: [fakeEngine(3, { n: 0 })],
+      stateStore: store,
+      progress: { intervalMs: 0 },
+      taskLogSink: () => ({ addLogs: (batch) => void lines.push(...batch) }),
+    });
+
+    await worker.execute(task());
+    lines.length = 0;
+    // responseTimeout → TIMED_OUT → 重试：新 taskId、retryCount +1，task log 从头开始
+    await worker.execute(task({ taskId: 't2', retryCount: 1 }));
+    expect(lines.some((l) => l.includes('从第') && l.includes('步恢复'))).toBe(true);
+  });
+
+  it('没有 taskLogSink 时只走权威通道，不报错', async () => {
+    const worker = compileAgentWorker(spec(), {
+      engines: [fakeEngine(1, { n: 0 })],
+      stateStore: await redisStore(),
+    });
+    const r = await worker.execute(task());
+    expect(r.status).toBe('COMPLETED');
+    expect(r.outputData?.progress).toBeDefined();
   });
 });

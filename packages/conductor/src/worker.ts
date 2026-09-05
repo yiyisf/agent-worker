@@ -9,6 +9,7 @@ import {
   MemoryStateStore,
   assertCapabilities,
   decideResume,
+  progressFromJournal,
   runSlice,
 } from '@ca/core';
 import type {
@@ -23,6 +24,12 @@ import type {
   StateStore,
 } from '@ca/core';
 import { checkHandbackBudget } from './lease.js';
+import {
+  createProgressReporter,
+  resumeSummaryLine,
+  type ConductorProgressOptions,
+  type TaskLogSink,
+} from './progress.js';
 import { deriveTaskDef, taskTypeOf } from './taskdef.js';
 import { TerminalTaskError, toTaskResult, type MappedTaskResult, type ResultMapperOptions } from './result-mapper.js';
 
@@ -58,7 +65,13 @@ export interface CompileDeps {
   eventSinks?: readonly EventSink[];
   logger?: Logger;
   workerId?: string;
-  /** 运行中把进展交给它（M1.4 接上 Task Log 与 outputData.progress） */
+  /**
+   * 进展的**尽力而为**通道（§10.4）：通常包一层官方 SDK 的 getTaskContext()?.addLog。
+   * 不提供则只写权威通道 outputData.progress。
+   */
+  taskLogSink?: (task: ConductorTaskLike) => TaskLogSink | undefined;
+  progress?: ConductorProgressOptions;
+  /** 额外的进展观察点（自建监控、StreamSink 等） */
   onProgress?: (task: ConductorTaskLike, report: ProgressReport) => void;
   /** 取消检测：返回 true 表示该工作流已终止，应中止本次运行（§6.4） */
   isWorkflowCancelled?: (workflowInstanceId: string) => Promise<boolean>;
@@ -178,7 +191,18 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
         };
 
         const resumeWith = task.inputData?.[RESUME_INPUT_KEY] as JsonValue | undefined;
-        let lastProgress: ProgressReport | undefined;
+
+        // ── 进展反馈（§10.4 / ADR-0018）──
+        const progress = createProgressReporter(deps.taskLogSink?.(task), {
+          ...(deps.progress ?? {}),
+          ...(deps.logger ? { logger: deps.logger } : {}),
+        });
+        // 跨 taskId 重试会让 task log 断档（log 挂在 taskId 上，callback 交还不换 taskId），
+        // 所以新 task 实例的第一条日志把断点接上
+        if ((task.retryCount ?? 0) > 0) {
+          const prior = progressFromJournal(history);
+          if (prior && prior.step > 0) progress.report({ ...prior, phase: resumeSummaryLine(prior) });
+        }
 
         const outcome = await runSlice({
           spec,
@@ -189,10 +213,14 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
           lease: held,
           ...(resumeWith !== undefined ? { resumeWith } : {}),
           onProgress: (r) => {
-            lastProgress = r;
+            progress.report(r);
             deps.onProgress?.(task, r);
           },
         });
+
+        // 分片边界把被节流压住的最后一条吐出来，再统一推给 Conductor
+        progress.flush();
+        await progress.drain();
 
         // ── 交还预算：真正的约束是 Σ(执行 + 等待) < timeoutSeconds（§2.2）──
         let callbackAfterSeconds: number | undefined;
@@ -223,7 +251,9 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
           {
             outcome,
             ...(callbackAfterSeconds !== undefined ? { callbackAfterSeconds } : {}),
-            ...(lastProgress ? { progress: lastProgress as unknown as JsonValue } : {}),
+            ...(progress.snapshot()
+              ? { progress: progress.snapshot() as unknown as JsonValue }
+              : {}),
           },
           deps.resultMapper ?? {},
         );

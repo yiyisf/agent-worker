@@ -17,7 +17,7 @@ export type * from './context.js';
 export type * from './guardrail.js';
 export type * from './events.js';
 export type * from './loader.js';
-export type * from './progress.js';
+
 
 export * from './errors.js';
 export * from './hash.js';
@@ -25,5 +25,6 @@ export * from './budget.js';
 export * from './gateway.js';
 export * from './capabilities.js';
 export * from './runner.js';
+export * from './progress.js';
 export { hasTerminalEntry } from './journal.js';
 export { MemoryStateStore, MemoryBlobStore } from './stores/memory.js';
