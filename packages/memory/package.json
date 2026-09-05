@@ -5,9 +5,18 @@
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0",
+    "@ca/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@ca/testing": "workspace:*"
   }
 }

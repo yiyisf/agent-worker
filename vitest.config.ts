@@ -10,6 +10,8 @@ export default defineConfig({
       '@ca/core/testkit': r('./packages/core/src/testkit.ts'),
       '@ca/core': r('./packages/core/src/index.ts'),
       '@ca/testing': r('./packages/testing/src/index.ts'),
+      '@ca/memory': r('./packages/memory/src/index.ts'),
+      '@ca/conductor': r('./packages/conductor/src/index.ts'),
     },
   },
   test: {

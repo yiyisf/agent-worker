@@ -1,7 +1,8 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
 > 状态：Draft v0.6 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
-> 上游 Agent SDK 基线：**`ai@7.0.93`**（v0.4–v0.5 的所有 AI SDK 结论均基于 v7 主干核实）
+> 上游基线（M1 实装核实）：**`ai@7.0.93`**、**`@io-orkes/conductor-javascript@4.0.0`**
+> —— 官方 Conductor SDK 的实际发布版是 4.0.0（不是早前文中写的 3.x），`TaskManager` / `TaskRunner` / `TaskHandler` / `LeaseTracker` / `getTaskContext` / `NonRetryableException` 在 4.0.0 均在，ADR-0006 的复用清单不受影响。
 >
 > **v0.6 变更**
 > 1. **纠错**：`@ca/engine-ai-sdk` 的 peerDependency 原写 `ai >= 5.0.0`，而 `ToolLoopAgent` /

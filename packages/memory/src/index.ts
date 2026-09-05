@@ -1,10 +1,9 @@
 /**
- * @ca/memory —— StateStore / BlobStore / MemoryStore 的实现集合。
- * 见 docs/architecture.md §9。三者职责必须分清：
- *   StateStore  journal / 租约 / resume，生命周期 = 一次 run（+ 排障 TTL）
- *   BlobStore   transcript / 大 payload，生命周期 = 审计要求
- *   MemoryStore 跨 run 的长期记忆，生命周期 = 业务定义
+ * @ca/memory —— StateStore / BlobStore 的持久化实现。见 docs/architecture.md §8。
  *
- * M0 骨架：待实现 memoryStateStore / redisStateStore / postgresStateStore / fsBlobStore / s3BlobStore
+ * 默认的 callback 分片策略要求持久化 StateStore；@ca/core 里的内存实现只供本地开发，
+ * createAgentWorker 会在启动时拒绝它。
+ *
+ * 待实现（M2+）：postgres StateStore、s3 BlobStore、MemoryStore（跨 run 长期记忆）
  */
-export {};
+export * from './redis.js';
