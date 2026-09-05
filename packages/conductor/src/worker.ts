@@ -1,24 +1,28 @@
 /**
- * 用户入口：把 AgentDefinition 挂到 Conductor 上。见 docs/architecture.md §6.1。占位。
+ * 用户入口：把 AgentSpec 挂到 Conductor 上。见 docs/architecture.md §6.1。占位。
  *
  * 本层是**薄桥接**（ADR-0006）：poll 循环、并发、心跳、指标、优雅停机全部交给官方
- * `@io-orkes/conductor-javascript` 的 TaskManager；这里只负责把 AgentDefinition 编译成
+ * `@io-orkes/conductor-javascript` 的 TaskManager；这里只负责把 AgentSpec 编译成
  * 官方的 ConductorWorker，并在 execute 内外接上 journal / fencing / 结果映射 / 取消检测。
  *
  * 预期用法（M1）：
  *
  *   const worker = createAgentWorker({
- *     agents: [researchAgent],
+ *     specs: [researchSpec],
+ *     engines: [aiSdkToolLoopEngine],
  *     stateStore: redisStateStore({ url: process.env.REDIS_URL! }),
  *   });
  *   await worker.start();
  */
-import type { AgentDefinition, BlobStore, EventSink, StateStore } from '@ca/core';
+import type { AgentEngine, AgentSpec, BlobStore, EventSink, StateStore } from '@ca/core';
 import type { ConnectionOptions } from './types.js';
 import type { CancellationWatcherOptions } from './cancellation.js';
 
 export interface AgentWorkerOptions {
-  agents: AgentDefinition[];
+  /** 纯数据的 Agent 描述；SpecLoader 会做三层合并与校验（ADR-0013） */
+  specs: AgentSpec[];
+  /** 已注册的引擎，按 AgentSpec.engine 标识查找（ADR-0011） */
+  engines: AgentEngine[];
   /** 省略则完全走官方 SDK 的 env 约定 */
   connection?: ConnectionOptions;
   workerId?: string;
@@ -47,6 +51,6 @@ export declare function createAgentWorker(options: AgentWorkerOptions): AgentWor
  *   { taskDefName, execute, leaseExtendEnabled, concurrency, pollInterval, domain }
  */
 export declare function compileAgentWorker(
-  def: AgentDefinition,
-  deps: Omit<AgentWorkerOptions, 'agents'>,
+  spec: AgentSpec,
+  deps: Omit<AgentWorkerOptions, 'specs'>,
 ): unknown;

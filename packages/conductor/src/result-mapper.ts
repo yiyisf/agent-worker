@@ -7,7 +7,7 @@
  * - transcript 始终外置到 BlobStore，output 只留 ref
  * - Task Log 通过官方 getTaskContext()?.addLog() 写，不自研日志通道
  */
-import type { AgentResult, BlobStore } from '@ca/core';
+import type { BlobStore, EngineTurn, JsonValue } from '@ca/core';
 import type { LeaseOutcome } from './lease.js';
 
 export interface ResultMapperOptions {
@@ -25,7 +25,8 @@ export interface MappedTaskResult {
 }
 
 export interface ResultMapper {
-  toTaskResult(result: AgentResult, outcome: LeaseOutcome): Promise<MappedTaskResult>;
+  /** EngineTurn 的 done / continue / suspended 三态直接对应 COMPLETED 与 IN_PROGRESS 的两种交还 */
+  toTaskResult(turn: EngineTurn<JsonValue>, outcome: LeaseOutcome): Promise<MappedTaskResult>;
   toFailure(err: unknown): Promise<MappedTaskResult>;
 }
 

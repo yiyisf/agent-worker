@@ -1,4 +1,4 @@
-/** 运行上下文，见 docs/architecture.md §4.2。占位：仅声明契约。 */
+/** 运行上下文，见 docs/architecture.md §4.8。占位：仅声明契约。 */
 import type { AgentEvent } from './events.js';
 
 export interface Logger {
@@ -13,7 +13,7 @@ export interface BudgetView {
   usedOutputTokens: number;
   usedCostUsd: number;
   elapsedMs: number;
-  remaining(metric: 'tokens' | 'cost' | 'time' | 'steps'): number;
+  remaining(metric: 'tokens' | 'cost' | 'time' | 'toolCalls'): number;
 }
 
 export interface SecretProvider {
@@ -30,20 +30,13 @@ export interface ConductorSource {
   retryCount: number;
 }
 
-export interface SuspendRequest {
-  reason: string;
-  /** 期望多久之后被重新调度（秒） */
-  callbackAfterSeconds: number;
-  /** 恢复时回灌给循环的上下文键 */
-  awaiting?: Record<string, unknown>;
-}
-
 export interface RunContext {
-  /** 恢复锚点：`${workflowInstanceId}:${taskReferenceName}:${epoch}`，见 §5.2 */
+  /** 恢复锚点：`${workflowInstanceId}:${taskReferenceName}:${epoch}`（§5.2） */
   readonly runKey: string;
-  /** 单次物理执行 id，恢复后会变化 */
   readonly runId: string;
   readonly attempt: number;
+  /** callback 分片序号，从 0 开始 */
+  readonly sliceIndex: number;
   readonly tenantId?: string;
   readonly source?: ConductorSource;
 
@@ -55,11 +48,5 @@ export interface RunContext {
   readonly budget: BudgetView;
   readonly secrets: SecretProvider;
 
-  /** 受管的非确定性入口 —— 直接用 Date.now()/Math.random() 会破坏重放（ADR-0003） */
-  now(): number;
-  random(): number;
-
   emit(event: AgentEvent): void;
-  /** 挂起当前运行，写 journal 并交还控制权（§7.4） */
-  suspend(req: SuspendRequest): never;
 }

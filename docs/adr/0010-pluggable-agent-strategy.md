@@ -1,6 +1,6 @@
 # ADR-0010：可插拔的 `AgentStrategy`，决策与执行分离
 
-- 状态：Accepted（`AgentStrategy` 接口在 v1 期间标记 experimental）
+- 状态：**Superseded by [ADR-0011](0011-agent-engine-over-strategy.md)**（2026-09-05）
 - 日期：2026-09-05
 
 ## 背景
@@ -57,3 +57,19 @@ Runtime 负责执行 `StepPlan`、写 journal、做幂等、扣预算、跑护�
   replay 幂等、suspend/resume 正确性），既是我们的回归，也是插件作者的验收工具。
 - **接口可能不够用**：多 Agent 协作、流式中途干预等形态未必能用当前 `StepPlan` 表达。
   → v1 期间标记 `experimental`，允许 minor 破坏；需要至少 2 个真实第三方策略验证后再转 stable。
+
+---
+
+## 推翻原因（2026-09-05）
+
+本 ADR 打算自研循环范式契约并内置 5 种策略。核查 Vercel AI SDK 后确认，这 5 种范式
+以及配套能力（停止条件、上下文压缩、工具收窄、动态模型、结构化输出、HITL 审批、
+provider 生态、MCP、以及 9+ 个既有 harness 的适配）它已全部覆盖，且更成熟。
+
+这是本项目第三次出现「先自建、后发现生态已有」（前两次是 ADR-0002 与 ADR-0004）。
+改为 [ADR-0011](0011-agent-engine-over-strategy.md) 的 `AgentEngine` 适配契约。
+
+**保留并强化的部分**：本 ADR 最有价值的洞察是「决策与执行分离，使自定义扩展零成本继承
+全部可靠性机制」。[ADR-0012](0012-reliability-by-interception.md) 把它推得更远——
+可靠性根本不需要拥有循环，只需要拦截模型与工具两个入口。
+`snapshot` / `replay` 两种状态恢复模式也保留，进入 `EngineCapabilities.state`。

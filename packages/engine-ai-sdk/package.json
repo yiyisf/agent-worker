@@ -1,7 +1,7 @@
 {
-  "name": "@ca/testing",
+  "name": "@ca/engine-ai-sdk",
   "version": "0.0.0",
-  "description": "引擎一致性套件、脚本化模型、崩溃/并发/分片注入",
+  "description": "适配 Vercel AI SDK ToolLoopAgent 的 AgentEngine 实现",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -11,5 +11,11 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts"
+  },
+  "dependencies": {
+    "@ca/core": "workspace:*"
+  },
+  "peerDependencies": {
+    "ai": ">=5.0.0"
   }
 }

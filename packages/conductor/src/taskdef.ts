@@ -1,5 +1,5 @@
 /**
- * 由 AgentDefinition.limits 推导 Conductor TaskDef，见 docs/architecture.md §6.6。占位。
+ * 由 AgentSpec.limits 推导 Conductor TaskDef，见 docs/architecture.md §6.6。占位。
  *
  * 公式（v0.3，随默认策略改为 callback 而修订）：
  *
@@ -17,7 +17,7 @@
  *   2. retryCount 不可为 0 —— responseTimeout 超时会判 TIMED_OUT 并消耗一次重试配额
  *   另注：timeoutPolicy 对 responseTimeout 无效（该路径直接 timeoutTask()），仅作用于 timeoutSeconds
  */
-import type { AgentDefinition } from '@ca/core';
+import type { AgentSpec } from '@ca/core';
 
 /** 结构对齐官方 SDK 的 TaskDef，注册时交给官方 MetadataClient */
 export interface DerivedTaskDef {
@@ -36,7 +36,7 @@ export interface DerivedTaskDef {
   rateLimitFrequencyInSeconds?: number;
 }
 
-export declare function deriveTaskDef(def: AgentDefinition): DerivedTaskDef;
+export declare function deriveTaskDef(spec: AgentSpec): DerivedTaskDef;
 
 export interface TaskDefDrift {
   name: string;

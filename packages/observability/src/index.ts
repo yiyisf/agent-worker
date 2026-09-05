@@ -6,10 +6,11 @@
  * Prometheus 采集（CanonicalMetricsCollector / MetricsServer），本包不重复实现。
  *
  * M0 骨架：待实现
- * - otelEventSink：span 树 agent.run → agent.step → gen_ai.chat / tool.execute
+ * - otelEventSink：span 树 agent.run → agent.slice → gen_ai.chat / tool.execute
+ *   两个受管入口天然就是埋点位置 —— 不需要引擎配合，换引擎不丢埋点（ADR-0012）
  * - 从任务输入的 _traceparent 继承 trace context，traceId 回写 outputData
- * - Agent 语义指标：token / cost / 步数分布 / 工具成功率 / 护栏拦截率 /
- *   恢复次数 / fence 抢占次数 / 预算触顶次数
+ * - Agent 语义指标：token / cost（按 model/tenant/spec/engine）、分片数分布、
+ *   replay 命中率、工具成功率、护栏拦截率、fence 抢占次数、预算触顶次数、能力降级次数
  * - taskLogSink：经官方 getTaskContext()?.addLog() 写进度，供 Conductor UI 观察
  */
 export {};

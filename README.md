@@ -1,84 +1,129 @@
 # Conductor AI Agent Worker SDK
 
-面向 [Conductor OSS](https://conductor-oss.org/) 的**通用、可扩展**AI Agent worker SDK：
+面向 [Conductor OSS](https://conductor-oss.org/) 的 AI Agent worker SDK：
 工作流里放一个 task，背后就是一次完整的、可观测、可恢复、有预算约束的 Agent 运行。
 
 - **语言**：TypeScript (Node.js ≥ 20)
 - **执行模式**：Worker 内闭环 —— 一个 Conductor task = 一次完整 Agent 运行，循环跑在 **worker 进程内**
+- **Agent 能力**：**不自建**。由外部 Agent SDK 提供（首选 [Vercel AI SDK](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
-- **底座**：构建在官方 [`@io-orkes/conductor-javascript`](https://github.com/conductor-oss/javascript-sdk) 之上，不重复实现传输层
-- **当前状态**：M0，架构设计与目录骨架（v0.3）。代码为契约声明，尚无实现。
+- **当前状态**：M0，架构设计与目录骨架（v0.4）。代码为契约声明，尚无实现。
 
-## 设计要点
+## 这个 SDK 做什么、不做什么
 
-### 1. 通用 + 可扩展：三层扩展面
+```
+外部 Agent SDK 负责          本 SDK 负责
+─────────────────────       ─────────────────────
+推理循环 / 停止条件           Journal 与崩溃恢复
+上下文压缩 / 工具收窄          effectively-once（幂等 + Fencing）
+工具定义 DSL                 预算治理（token / cost / 时间）
+模型 provider 生态            Conductor 租约与分片执行
+MCP 客户端                   结果映射与 payload 治理
+结构化输出                   OTel GenAI 埋点与成本归集
+既有 harness 适配             配置化（AgentSpec）与领域定制
+```
 
-推理循环本身是扩展点，不绑定单一 Agent 范式（[ADR-0010](docs/adr/0010-pluggable-agent-strategy.md)）：
+核心洞察：**可靠性不需要拥有循环，只需要拦截两个入口** —— 模型调用（决定成本）
+与工具执行（决定副作用）。循环的其余部分既不花钱也无副作用，没有拦截价值。
+于是 `@ca/core` 只需提供两个 `guard` 函数，任何 Agent SDK 都能在几十行内适配
+（[ADR-0012](docs/adr/0012-reliability-by-interception.md)）。
 
-| 层 | 扩展点 | 介入深度 |
-|---|---|---|
-| **L1** 替换实现 | `ModelProvider` / `ToolProvider` / `StateStore` / `BlobStore` / `MemoryStore` / `SecretProvider` / `EventSink` | 换后端，不改行为 |
-| **L2** 改变行为 | `Guardrail` / `ContextPolicy` / `ToolSelector` / `OutputParser` / `ErrorClassifier` / `BudgetPolicy` / `PromptSource` | 介入循环，不重写循环 |
-| **L3** 替换循环 | `AgentStrategy` —— 内置 `react` / `plan-execute` / `reflect` / `single-shot` / `router`，可注册自定义 | 换范式 |
+```ts
+// 引擎适配器的全部义务：让调用经过受管入口
+const model = wrapLanguageModel({          // AI SDK 中间件
+  model: userModel,
+  middleware: { wrapGenerate: ({ doGenerate, params }) =>
+    deps.model.guard(params, async () => { /* ... */ }) },
+});
+const tools = mapValues(userTools, (t, name) => ({
+  ...t,
+  execute: (input, opts) => deps.tools.guard(name, input, () => t.execute!(input, opts)),
+}));
+```
 
-外加**场景 Profile**（打包 策略+限额+护栏+租约）与 `@ca/plugin-*` 插件约定。
+## 三层设计
 
-**关键设计：策略只做决策，不做执行。** 策略返回 `StepPlan`（意图），由 Runtime 去执行、写 journal、
-做幂等、扣预算、跑护栏、记 span。因此**任何自定义策略都零成本继承全部可靠性机制**——
-这是本 SDK 相对「自己写个 while 循环」的核心价值。
+### 1. `AgentEngine` —— 适配任意 Agent SDK
 
-### 2. Journaled Replay
+契约只有 3 个成员（`capabilities` / `build` / `run`）。首批适配：
 
-每步写 append-only journal，恢复即重放；命中 journal 的步不再调 LLM、不再调工具。
-at-least-once 投递下不重复付费、不重复产生副作用。配合 Fencing Token 达到实际意义上的 effectively-once。
+| 引擎 | 覆盖 |
+|---|---|
+| `@ca/engine-ai-sdk` | AI SDK `ToolLoopAgent`（`stopWhen` / `prepareStep` / `toolApproval` / provider 生态 / `@ai-sdk/mcp`） |
+| `@ca/engine-harness` | AI SDK `HarnessAgent` → Claude Code / Cline / Codex / Cursor / Deep Agents / fx / Grok Build / OpenCode / Pi |
+| `@ca/engine-custom` | 最小手写循环参考实现，兼作一致性测试基线 |
 
-### 3. 默认 `callback` 分片执行
+**`EngineCapabilities` 显式建模能力差异，不假装统一。** 例如 sandbox 型 harness 的工具在沙箱内执行，
+我们拦截不到 → core 拒绝这类 spec 声明 `effectful` 工具策略。宣称"支持任意 SDK"却不说清能力边界，
+比不支持更危险 —— 用户会误以为拿到了 effectively-once。
 
-`callback` 让「持久化 journal → 换个进程继续」变成**每次运行都走的主路径**，
-而不是只在崩溃时才跑的旁路——只在故障时才执行的代码就是不可靠的代码
-（[ADR-0009](docs/adr/0009-default-callback-strategy.md)）。
-`lease-extend`（心跳续租）作为可选优化保留，要求 Conductor ≥ v3.10.7。
+### 2. `AgentSpec` —— 纯 JSON 的配置化
 
-### 4. 不重复造轮子
+```jsonc
+{
+  "name": "claims_triage",
+  "extends": ["@acme/ca-pack-insurance#claimsTriageBase"],
+  "engine": "ai-sdk/tool-loop",
+  "engineOptions": { "model": "claude-sonnet-5", "stopWhen": { "isStepCount": 30 } },
+  "toolPolicies": { "openClaim": { "effect": "effectful", "onAmbiguousReplay": "probe" } },
+  "limits": { "maxCostUsd": 2, "wallClockMs": 900000 },
+  "conductor": { "leaseStrategy": "callback", "domain": "insurance" }
+}
+```
 
-鉴权、poll 循环、并发、`extendLease` 心跳、`TaskContext`、worker 指标全部复用官方 SDK；
-`@ca/conductor` 只是薄桥接层（[ADR-0006](docs/adr/0006-build-on-official-sdk.md)）。
-`@ca/core` 不依赖 Conductor，核心单测不需要装官方 SDK。
+`engineOptions` 对 core **不透明**是刻意的——统一各引擎的原生配置等于重新发明每个 SDK。
 
-## Conductor 版本要求
+### 3. 领域定制：L0 → L1 → L2
 
-| 能力 | 最低版本 | 依据 |
-|---|---|---|
-| `callback` 策略（默认） | 3.x 全系 | `callbackAfterSeconds` 一直存在 |
-| `lease-extend` / `hybrid` | **v3.10.7** | `TaskResult.extendLease` 字段与服务端处理逻辑自该版本引入（v3.10.6 无） |
+L0 通用默认 → L1 领域包（`@acme/ca-pack-<domain>`：工具、策略、护栏、prompt、spec 片段、eval 集）
+→ L2 实例 spec，逐层覆盖。合并结果输出 **effective spec 快照**写入 journal 与 `outputData`，
+使「这次运行到底用的什么配置」可追溯（[ADR-0013](docs/adr/0013-agent-spec-and-domain-packs.md)）。
 
-服务端租约/超时的精确语义（源码级核实）见 [architecture.md §2.2](docs/architecture.md#22-服务端语义核实依据-conductor-oss-v32121-源码)，
-其中三条容易踩的坑：`retryCount` 不可为 0、`timeoutSeconds` 必须覆盖所有等待时间、`timeoutPolicy` 对 responseTimeout 无效。
+## Conductor 对接（v0.3 已对齐）
+
+| 能力 | 最低版本 |
+|---|---|
+| `callback` 策略（默认） | 3.x 全系 |
+| `lease-extend` / `hybrid` | **v3.10.7**（`TaskResult.extendLease` 自该版本引入） |
+
+服务端租约/超时的精确语义见 [architecture.md §2.2](docs/architecture.md#22-服务端语义v32121-源码核实结论)，
+三条容易踩的坑：`retryCount` 不可为 0、`timeoutSeconds` 必须覆盖所有等待时间、`timeoutPolicy` 对 responseTimeout 无效。
+
+**`EngineTurn` 与 Conductor 分片天然同构**：引擎交还一轮 = 桥接层交还一个分片。
+AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要任何 hack。
 
 ## 从这里开始
 
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 完整技术架构设计 |
-| [§2 关键约束](docs/architecture.md#2-关键约束conductor-语义-vs-ai-agent-的天然冲突) | Conductor 语义与 Agent 现实的 7 条冲突 + 服务端语义核实 |
-| [§4.3 扩展架构](docs/architecture.md#43-扩展架构--三层扩展面) | 三层扩展面、AgentStrategy、Profile、插件 |
-| [docs/adr/](docs/adr/) | 10 条决策记录（含 2 条被后续推翻/修订的） |
+| [§3.1 核心洞察](docs/architecture.md#31-核心洞察可靠性不需要拥有循环) | 为什么 core 可以这么薄 |
+| [§4.4 能力边界](docs/architecture.md#44-enginecapabilities--诚实的能力边界) | 不同引擎的能力差异与校验 |
+| [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2 与 SpecLoader |
+| [docs/adr/](docs/adr/) | 13 条决策记录（含 3 条被后续推翻/修订的） |
 
 ## 仓库结构
 
 ```
-docs/            架构设计与 ADR
-packages/        core / conductor / providers-* / tools-mcp / memory / observability / testing / cli
-examples/        minimal-agent (M1) / hitl-approval (M4)
+packages/  core / engine-ai-sdk / engine-harness / engine-custom
+           conductor / memory / observability / testing / cli
+examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
 ```
 
 ## 路线图
 
-**M1** 最小可用（Runtime + react + journal + callback + Anthropic，跑通 3.21.21）
-→ **M2** 可靠性（fencing / 三类测试 / lease-extend + 版本探测）
-→ **M3** 扩展面（AgentStrategy 公开 + 5 内置策略 + L2 扩展点 + Profile + 插件）
-→ **M4** 生态（本地 MCP / 子工作流工具 / HITL）
-→ **M5** 生产化（OTel / 预算 / 多租户）
-→ **M6** 白盒模式（可选）
+**M1** 最小可用（core 契约 + 受管入口 + journal + callback + engine-ai-sdk，跑通 3.21.21）
+→ **M2** 可靠性（fencing + 三类测试 + **引擎一致性套件**）
+→ **M3** 多引擎（harness 能力降级 + custom + 能力校验）
+→ **M4** 配置化与领域定制 → **M5** HITL 与生态 → **M6** 生产化
 
-详见 [architecture.md §14](docs/architecture.md#14-路线图)。
+M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把契约打磨对，再谈通用——
+反过来做必然设计出架空的抽象。
+
+## 待确认
+
+**TanStack 的定位。** 其生态（Query / Store / Router / Pacer）以前端为主，
+[Pacer 官方文档](https://tanstack.com/pacer/latest/docs/overview)亦说明目前主要面向客户端，
+放进 worker 运行时依赖并不合适。若目标是**运行观测台 / 人工审批界面**，
+建议独立为 `@ca/console` 应用，通过 StreamSink 与 StateStore 读取，不进 worker 运行时——
+请确认这个理解是否与预期一致（见 [architecture.md §15](docs/architecture.md#15-遗留问题) 遗留问题 6）。
