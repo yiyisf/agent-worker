@@ -30,3 +30,12 @@ v1 采用 (a)。
 
 `StepExecutor` 接口把「执行一步」抽象出来，未来的 `ConductorStepExecutor` 可以把 step 下沉为 Conductor task，
 在不改核心状态机的前提下支持白盒模式（路线图 M5）。
+
+---
+
+## 补充（2026-09-05）
+
+本 ADR 否决的「Conductor 全编排」路线，正是官方 agents 层已经实现的路线——且由官方做掉了编译工作，
+用户不必手写 `DO_WHILE`/`SWITCH`，本 ADR 列出的三条代价（可观测性、payload 传递、迭代耦合）
+在官方实现里基本被消化。因此本 ADR 的结论**不再是无条件成立的**，
+其适用前提收敛为 [ADR-0008](0008-relation-to-official-agent-layer.md) 的四条约束。

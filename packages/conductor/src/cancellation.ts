@@ -1,6 +1,7 @@
 /**
  * 取消检测，见 docs/architecture.md §6.5。
- * Conductor 不推送取消，只能轮询工作流状态；同工作流的多个 run 合并为一次请求。
+ * Conductor 不推送取消，官方 SDK 也不提供，因此这部分仍由本项目自持：
+ * 轮询工作流状态，同工作流的多个 run 合并为一次请求（用官方 WorkflowClient 发请求）。
  * 占位：仅声明契约。
  */
 export interface CancellationWatcherOptions {

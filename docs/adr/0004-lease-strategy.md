@@ -1,6 +1,6 @@
 # ADR-0004：long-lease 与 yield 双租约策略
 
-- 状态：Accepted（含一条待验证假设）
+- 状态：**Revised by [ADR-0007](0007-lease-strategies-revised.md)**（2026-09-05）——核心假设被证伪
 - 日期：2026-09-05
 
 ## 背景
@@ -30,3 +30,19 @@ journal 写入与 Conductor 回写都需携带，落后者被拒绝并自我放�
 ## 代价
 
 - `yield` 强依赖持久化 StateStore，且有 journal 写放大。→ 启动时做配置校验，M2 压测量化写放大。
+
+---
+
+## 修订原因（2026-09-05）
+
+本 ADR 的核心假设——「Conductor 没有不释放任务的纯心跳原语」——**是错的**。
+
+Conductor 的 `updateTask` 支持 `extendLease: true`：只重置 `responseTimeoutSeconds` 计时器，
+**不把任务放回队列**。官方 SDK 已封装为 `leaseExtendEnabled` 开关和可独立使用的 `LeaseTracker`。
+
+由此，`long-lease`（把 `responseTimeoutSeconds` 设得比运行时长还长）这个策略不但没必要，
+而且**有害**：它让崩溃检测时间等于整个租约时长。修订后的三策略见
+[ADR-0007](0007-lease-strategies-revised.md)。
+
+保留有效的部分：Fencing Token 机制仍然必要（心跳降低但未消除重复投递），`callback` 策略
+（原 `yield`）仍然是等待外部信号的正确做法。

@@ -31,15 +31,20 @@ export interface AgentLimits {
 /** 崩溃后如何续跑，见 docs/architecture.md §5.2 */
 export type ResumePolicy = 'on-lease-loss' | 'fresh-per-retry' | 'never';
 
-/** 租约策略，见 ADR-0004 */
-export type LeaseStrategy = 'long-lease' | 'yield';
+/**
+ * 租约策略，见 ADR-0007。
+ * - lease-extend 默认。整个循环在一次 execute() 内跑完，由官方 SDK 的 extendLease 心跳续租
+ * - callback     IN_PROGRESS + callbackAfterSeconds 交还任务、释放槽位，适合等待外部信号
+ * - hybrid       计算期 lease-extend，进入等待态切 callback（长时 Agent 推荐）
+ */
+export type LeaseStrategy = 'lease-extend' | 'callback' | 'hybrid';
 
 export interface ConductorTaskOptions {
   /** 默认 `agent_<name>` */
   taskType: string;
   domain?: string;
   leaseStrategy: LeaseStrategy;
-  /** yield 策略下单个租约切片时长，默认 60_000 */
+  /** callback / hybrid 策略下单个切片时长，默认 60_000 */
   leaseSliceMs: number;
   resumePolicy: ResumePolicy;
   /** outputData 体积预算超限后的处理，见 §6.4 */

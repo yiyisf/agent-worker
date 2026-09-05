@@ -1,13 +1,21 @@
 {
   "name": "@ca/conductor",
   "version": "0.0.0",
-  "description": "Conductor 适配层：REST 客户端、poll 循环、租约、结果映射、TaskDef 生成",
+  "description": "官方 @io-orkes/conductor-javascript 之上的薄桥接层：Worker 编译、租约策略、结果映射、TaskDef 推导",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts"
+  },
+  "peerDependencies": {
+    "@io-orkes/conductor-javascript": ">=3.0.0"
+  },
+  "dependencies": {
+    "@ca/core": "workspace:*"
   }
 }
