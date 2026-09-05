@@ -40,6 +40,8 @@ export interface RunContext {
   readonly tenantId?: string;
   readonly source?: ConductorSource;
 
+  /** 本次 run 的起点（跨分片保持不变），预算的时间维度以它为基准 */
+  readonly startedAt: number;
   readonly deadline: number;
   /** 取消 / 超时 / 预算耗尽统一经由此 signal 传播 */
   readonly signal: AbortSignal;
