@@ -19,4 +19,5 @@ export type * from './context.js';
 export type * from './guardrail.js';
 export type * from './events.js';
 export type * from './loader.js';
+export type * from './progress.js';
 export * from './gateway.js';

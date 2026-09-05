@@ -16,6 +16,6 @@
     "@ca/core": "workspace:*"
   },
   "peerDependencies": {
-    "ai": ">=5.0.0"
+    "ai": "^7.0.0"
   }
 }

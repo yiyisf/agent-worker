@@ -15,12 +15,23 @@ import type { ManagedModelGateway, ManagedToolGateway } from './gateway.js';
  */
 export interface EngineCapabilities {
   /**
-   * 引擎代码在哪运行。interceptTools 由它机械推导，不必逐个适配器人工核实：
-   *   interceptTools = (runtimeLocation === 'host-process')
-   * AI SDK harness 适配器的运行位置见 architecture.md §4.4 的能力表。
+   * 成本可见性（v0.6 取代原来的 interceptModel 布尔量）：
+   * 'per-call' 每次模型调用都经过受管入口 → journal 可短路、预算可在调用**前**拦截
+   * 'per-turn' 拦不到单次调用，但每轮结束有 usage → 事后记账 + 轮间预算闸门
+   *            AI SDK 的 HarnessAgent 全部属于此类：它的 model 是 harness 专属字符串，
+   *            不存在可供 wrapLanguageModel 包装的模型对象（与沙箱无关）
+   * 'none'     完全无成本可见性 → 拒绝启动
    */
-  runtimeLocation: 'host-process' | 'sandbox';
-  /** 跨分片状态如何保存 */
+  costVisibility: 'per-call' | 'per-turn' | 'none';
+  /**
+   * 工具拦截范围（v0.6 取代原来的 interceptTools 布尔量）：
+   * 'all'                所有工具都经过受管入口
+   * 'host-declared-only' 只有我们声明的工具拦得到；引擎自带的内建工具拦不到 →
+   *                      effectful 只能声明在 host-declared 工具上，否则启动即拒绝
+   * 'none'               一个都拦不到 → 拒绝任何 effectful 策略
+   */
+  toolInterception: 'all' | 'host-declared-only' | 'none';
+  /** 跨分片状态如何保存。'engine-session' 表示避免重复付费由引擎的 session resume 负责，不是我们的 journal */
   state: 'messages' | 'snapshot' | 'engine-session' | 'replay';
   /**
    * 挂起机制（§4.7）。v0.5 删除了 replay-signal（ADR-0014）：
@@ -34,13 +45,10 @@ export interface EngineCapabilities {
    * 'none'   引擎的一轮不可中途拆分（如 harness 的一个 turn）→ 一轮 = 一分片
    */
   sliceControl: 'native' | 'none';
-  /** 能否拦截模型调用 —— 决定 journal 能否覆盖 LLM 成本。false 则拒绝启动 */
-  interceptModel: boolean;
-  /** 能否拦截工具执行 —— 决定幂等与副作用保护是否有效。
-   *  false（sandbox 内执行工具）则拒绝声明 effectful 策略的 spec */
-  interceptTools: boolean;
   /** journal 与恢复的粒度 */
   granularity: 'step' | 'turn';
+  /** 进展反馈能到什么粒度（§10.4 / ADR-0018） */
+  progress: 'step' | 'turn' | 'none';
   streaming: boolean;
   structuredOutput: boolean;
 }
@@ -111,10 +119,14 @@ export interface AgentEngine<TState = JsonValue> {
 /**
  * 能力—配置一致性校验；不满足则拒绝启动或显式降级并告警（§4.4）。
  *
- *   interceptModel: false                        → 拒绝启动（journal 形同虚设）
- *   interceptTools: false + spec 有 effectful 工具 → 拒绝启动（幂等保护不存在）
- *   interceptTools: false + 工具均为 pure         → 允许，journal 退化到 turn 级
- *   suspend: 'none' + spec 声明 approval          → 拒绝启动（不能跑到一半才发现停不下来）
- *   sliceControl: 'none'                          → 允许，一轮 = 一分片
+ *   costVisibility 'none'                              → 拒绝启动（完全看不见成本）
+ *   costVisibility 'per-turn'                          → 允许，预算降级为轮间闸门 + 告警
+ *   toolInterception 'none' + spec 有 effectful 工具    → 拒绝启动（幂等保护不存在）
+ *   toolInterception 'host-declared-only'
+ *       且 effectful 声明在**内建工具**上              → 拒绝启动（那个工具我们碰不到）
+ *   state 'engine-session'                             → 允许，避免重复付费由引擎 session resume 负责
+ *   suspend 'none' + spec 声明 approval                → 拒绝启动（不能跑到一半才发现停不下来）
+ *   sliceControl 'none'                                → 允许，一轮 = 一分片
+ *   progress 'none'                                    → 允许，进展退化到只在分片边界上报
  */
 export declare function assertCapabilities(spec: AgentSpec, caps: EngineCapabilities): void;

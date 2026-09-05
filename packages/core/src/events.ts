@@ -12,6 +12,8 @@ export type AgentEvent =
   | { type: 'tool.started'; stepId: string; name: string; replayed: boolean }
   | { type: 'tool.succeeded'; stepId: string; name: string; durationMs: number }
   | { type: 'tool.failed'; stepId: string; name: string; error: string; retryable: boolean }
+  /** 进展（§10.4）—— 低频有界，区别于 model.delta 的实时流 */
+  | { type: 'progress'; phase: string; step: number; totalSteps?: number; sliceIndex: number }
   | { type: 'guardrail.blocked'; rule: string; stage: string }
   | { type: 'budget.exceeded'; metric: 'tokens' | 'cost' | 'time' | 'toolCalls' }
   /** 引擎能力不足导致的降级，务必可观测（§4.4） */

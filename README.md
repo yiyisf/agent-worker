@@ -5,7 +5,7 @@
 
 - **语言**：TypeScript (Node.js ≥ 20)
 - **执行模式**：Worker 内闭环 —— 一个 Conductor task = 一次完整 Agent 运行，循环跑在 **worker 进程内**
-- **Agent 能力**：**不自建**。由外部 Agent SDK 提供（首选 [Vercel AI SDK](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
+- **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
 - **当前状态**：M0，架构设计与目录骨架（v0.4）。代码为契约声明，尚无实现。
 
@@ -53,9 +53,15 @@ const tools = mapValues(userTools, (t, name) => ({
 | `@ca/engine-harness` | AI SDK `HarnessAgent` → Claude Code / Cline / Codex / Cursor / Deep Agents / fx / Grok Build / OpenCode / Pi |
 | `@ca/engine-custom` | 最小手写循环参考实现，兼作一致性测试基线 |
 
-**`EngineCapabilities` 显式建模能力差异，不假装统一。** 例如 sandbox 型 harness 的工具在沙箱内执行，
-我们拦截不到 → core 拒绝这类 spec 声明 `effectful` 工具策略。宣称"支持任意 SDK"却不说清能力边界，
-比不支持更危险 —— 用户会误以为拿到了 effectively-once。
+**`EngineCapabilities` 显式建模能力差异，不假装统一。** 两个关键分级：
+
+- `costVisibility`：`ai-sdk/tool-loop` 是 `per-call`（每次模型调用都拦得到）；
+  **所有 harness 适配器都是 `per-turn`** —— `HarnessAgent` 的 `model` 是 harness 专属字符串，
+  不存在可包装的模型对象，与沙箱无关。预算因此降级为轮间闸门。
+- `toolInterception`：harness 一律 `host-declared-only` —— 我们传进去的工具拦得到，
+  它自带的内建工具拦不到，`effectful` 声明在内建工具上会被启动时拒绝。
+
+宣称"支持任意 SDK"却不说清能力边界，比不支持更危险 —— 用户会误以为拿到了 effectively-once。
 
 ### 2. `AgentSpec` —— 纯 JSON 的配置化
 
@@ -100,8 +106,9 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 | [§3.1 核心洞察](docs/architecture.md#31-核心洞察可靠性不需要拥有循环) | 为什么 core 可以这么薄 |
 | [§4.4 能力边界](docs/architecture.md#44-enginecapabilities--诚实的能力边界) | 不同引擎的能力差异与校验 |
 | [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2、SpecLoader、引擎契约版本 |
-| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 6 条、已定方案 2 条、仍开放 3 条 |
-| [docs/adr/](docs/adr/) | 17 条决策记录（含 3 条被后续推翻、2 条被修订的） |
+| [§10.4 进展反馈](docs/architecture.md#104-进展反馈让编排引擎在运行中就知道进度) | 运行中的进展同步回编排引擎（不是实时输出流） |
+| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条 |
+| [docs/adr/](docs/adr/) | 18 条决策记录（含 3 条被后续推翻、2 条被修订的） |
 
 ## 仓库结构
 

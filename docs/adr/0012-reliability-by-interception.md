@@ -1,6 +1,7 @@
 # ADR-0012：可靠性通过拦截两个入口实现，而非拥有循环
 
-- 状态：Accepted（`suspend` 一项被 [ADR-0014](0014-native-approval-only-suspension.md) 修订）
+- 状态：Accepted（`suspend` 被 [ADR-0014](0014-native-approval-only-suspension.md) 修订；
+  `interceptModel` / `interceptTools` 被 v0.6 换成分级，见下方补充）
 - 日期：2026-09-05
 
 ## 背景
@@ -80,3 +81,25 @@ interface EngineCapabilities {
 [ADR-0014](0014-native-approval-only-suspension.md)。
 
 本 ADR 的其余内容（两个受管入口、拦截式可靠性、`EngineCapabilities` 显式建模）不变。
+
+---
+
+## 补充（2026-09-05，v0.6）
+
+本 ADR 原先把可拦截性建模为两个布尔量。按 `ai@7.0.93` 核实后，二者都不够表达真实情况，已改为分级：
+
+- `interceptModel: boolean` → **`costVisibility: 'per-call' | 'per-turn' | 'none'`**。
+  原因：AI SDK 的 `HarnessAgent` 接受的 `model` 是 harness 专属**字符串标识符**，
+  「harness abstraction is separate from the provider/model abstraction」——
+  根本没有可供 `wrapLanguageModel` 包装的模型对象。所以 9 个 harness 适配器**全部**拦不到模型调用，
+  连 host-process 的 Cline、Pi 也不例外，与沙箱无关。
+  但适配器会归一化 `result.usage`，因此 turn 级记账可行 → 保留为 `'per-turn'`（轮间预算闸门），
+  而不是按原规则一律拒绝启动——否则整个 harness 生态直接出局。
+
+- `interceptTools: boolean` → **`toolInterception: 'all' | 'host-declared-only' | 'none'`**。
+  原因：harness 的工具有两个来源 —— 内建工具由 harness 运行时执行（拦不到），
+  我们用 `tool()` 传进去的 host-declared 工具「executes in your host」（拦得到）。
+  一个布尔量表达不了「一半能管一半不能管」。
+
+本 ADR 的核心主张（可靠性只依赖受管入口、不依赖拥有循环；能力必须显式建模而非假装统一）不变，
+反而因为这次修正更站得住：**能力模型不够细，就会把"部分可管"误报成"完全不可管"或"完全可管"。**

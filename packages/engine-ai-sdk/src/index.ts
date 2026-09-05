@@ -1,16 +1,18 @@
 /**
  * @ca/engine-ai-sdk —— 适配 Vercel AI SDK 的 ToolLoopAgent。见 docs/architecture.md §4.3、ADR-0011。
  *
+ * 上游基线：**ai@^7.0.0**（ToolLoopAgent / HarnessAgent / toolApproval 均为 v7 能力，v5 没有）。
+ *
  * contractVersion: 1（ADR-0017 —— 只在暴露给领域包的形状破坏性变化时 +1，与上游 ai 版本号无关）
  *
  * capabilities:
- *   runtimeLocation: 'host-process'  工具跑在本进程 → interceptTools 为 true
+ *   costVisibility: 'per-call'       wrapLanguageModel 的 wrapGenerate / wrapStream 拦得到每次调用
+ *   toolInterception: 'all'          包装 tool({ execute })
  *   state: 'messages'                AI SDK 的 messages 数组本身就是可序列化的跨分片状态
  *   suspend: 'native-approval'       toolApproval 的两段式审批与 Conductor callback 分片同构
  *   sliceControl: 'native'           SliceBudget 翻译成 stopWhen 自定义停止条件
- *   interceptModel: true             wrapLanguageModel 的 wrapGenerate / wrapStream
- *   interceptTools: true             包装 tool({ execute })
  *   granularity: 'step'
+ *   progress: 'step'                 onStepFinish 可把 phase 填得更语义化（§10.4）
  *
  * 适配要点（M1 实现）：
  *

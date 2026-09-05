@@ -1,22 +1,18 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
-> 状态：Draft v0.5 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
+> 状态：Draft v0.6 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
+> 上游 Agent SDK 基线：**`ai@7.0.93`**（v0.4–v0.5 的所有 AI SDK 结论均基于 v7 主干核实）
 >
-> **v0.5 变更（清理遗留问题：9 条中关闭 6 条、定案 3 条）**
-> 1. §2.2 补两条服务端事实：崩溃检测延迟 ≈ `responseTimeoutSeconds + 1s`，且**该值同时决定
->    Conductor 扫描这个工作流的频率**；`callbackAfterSeconds` 无服务端上限。
-> 2. §4.4 能力模型细化：`interceptTools` 由适配器的**运行位置**机械推导，附 9 个 harness 的能力表。
-> 3. §4.7 **删除 `replay-signal` 挂起路径**，挂起只走引擎原生审批
->    （[ADR-0014](adr/0014-native-approval-only-suspension.md)）。
-> 4. §4.4 / §5.3 新增 `sliceControl`：分片边界由 core 给预算、引擎翻译成原生停止条件
->    （[ADR-0015](adr/0015-slice-budget-negotiation.md)）。
-> 5. §5.2 恢复判据改为**看自己的 journal 终态**，不再从 Conductor 的 `retryCount` 推断
->    （[ADR-0016](adr/0016-resume-decision-from-journal.md)）。
-> 6. §7.3 新增**引擎契约版本**，把版本耦合收敛到自己控制的一层
->    （[ADR-0017](adr/0017-engine-contract-version.md)）。
-> 7. §6.6 `responseTimeoutSeconds` 加下限 30s；§15 补回 v0.4 重写时遗漏的 Conductor 侧遗留问题。
+> **v0.6 变更**
+> 1. **纠错**：`@ca/engine-ai-sdk` 的 peerDependency 原写 `ai >= 5.0.0`，而 `ToolLoopAgent` /
+>    `HarnessAgent` / `toolApproval` 都是 **v7** 的能力，已改为 `^7.0.0`。
+> 2. **§15.3 第 1 条结案，且结论与 v0.5 的假设不同**：harness 的模型调用**全部**拦不到
+>    （不分沙箱与否）。能力模型据此重构——`interceptModel` / `interceptTools` 两个布尔量
+>    换成 `costVisibility` 与 `toolInterception` 两个分级（§4.4）。
+> 3. **新增 §10.4 进展反馈**：运行中的阶段性进展同步回编排引擎，不必等到完成才知道结果
+>    （[ADR-0018](adr/0018-progress-reporting.md)）。注意是**进展**，不是执行过程的实时输出流。
 >
-> v0.4 的重构（薄 core、`AgentEngine`、拦截式可靠性、`AgentSpec`）不变，见 ADR-0011～0013。
+> v0.4–v0.5 的其余结论不变。
 
 ---
 
@@ -358,48 +354,81 @@ const tools = mapValues(userTools, (t, name) => ({
 
 ```ts
 interface EngineCapabilities {
-  /** 引擎的代码在哪运行 —— interceptTools 由它机械推导，见下 */
-  runtimeLocation: 'host-process' | 'sandbox';
-  /** 跨分片的状态如何保存 */
+  /**
+   * 成本可见性（v0.6 取代原来的 interceptModel 布尔量）：
+   * 'per-call' 每次模型调用都经过受管入口 → journal 可短路、预算可在调用**前**拦截
+   * 'per-turn' 拦不到单次调用，但每轮结束有 usage → 事后记账 + **轮间**预算闸门
+   * 'none'     完全无成本可见性 → 拒绝启动
+   */
+  costVisibility: 'per-call' | 'per-turn' | 'none';
+  /**
+   * 工具拦截范围（v0.6 取代原来的 interceptTools 布尔量）：
+   * 'all'                所有工具都经过受管入口
+   * 'host-declared-only' 只有我们声明的工具拦得到，引擎自带的内建工具拦不到
+   * 'none'               一个都拦不到 → 拒绝任何 effectful 策略
+   */
+  toolInterception: 'all' | 'host-declared-only' | 'none';
+  /** 跨分片状态如何保存。'engine-session' 表示避免重复付费由引擎的 session resume 负责，而非我们的 journal */
   state: 'messages' | 'snapshot' | 'engine-session' | 'replay';
-  /** 挂起机制。v0.5 删除了 replay-signal，见 ADR-0014 */
+  /** 挂起机制（§4.7）。v0.5 删除了 replay-signal，见 ADR-0014 */
   suspend: 'native-approval' | 'none';
-  /** 分片边界：引擎能否接受 core 给的 sliceBudget 并翻译成原生停止条件（ADR-0015） */
+  /** 分片边界：引擎能否接受 core 给的 SliceBudget 并翻译成原生停止条件（ADR-0015） */
   sliceControl: 'native' | 'none';
-  /** 能否拦截模型调用 —— 决定 journal 能否覆盖 LLM 成本 */
-  interceptModel: boolean;
-  /** 能否拦截工具执行 —— 决定幂等与副作用保护是否有效 */
-  interceptTools: boolean;
   /** journal 与恢复的粒度 */
   granularity: 'step' | 'turn';
+  /** 进展反馈能到什么粒度（§10.4） */
+  progress: 'step' | 'turn' | 'none';
   streaming: boolean;
   structuredOutput: boolean;
 }
 ```
 
-#### `interceptTools` 不靠逐个试，靠运行位置推导
+#### v0.5 的假设被推翻：harness 的模型调用**全部**拦不到
 
-```
-interceptTools = (runtimeLocation === 'host-process')
-```
+v0.5 猜测「sandbox 型 harness 的模型调用可能也在沙箱内」，列为待实测。
+按 `ai@7.0.93` 核实，实际情况比猜测更彻底，而且**与沙箱无关**：
 
-工具跑在我们自己进程里就拦得住，跑在沙箱里就拦不住。AI SDK 的 harness 适配器能力表直接给出了运行位置，
-照抄成适配器里的常量即可（下表按官方文档整理，随 AI SDK 更新时同步）：
+- `HarnessAgent({ harness, model: 'claude-sonnet-4-6', sandbox, ... })` 的 `model` 是一个
+  **harness 专属的字符串标识符**，不是 AI SDK 的 `LanguageModel` 对象。
+- 官方原话：「The AI SDK harness abstraction is **separate from the provider/model abstraction**」，
+  且「Set `model` to select the model that **the harness runtime uses**」。
 
-| 适配器 | 运行位置 | `interceptTools` | 原生审批 | 结构化输出 |
-|---|---|---|---|---|
-| Cline | host process | ✅ | ✅ | ✅ |
-| Pi | host process | ✅ | ✅ | ❌ |
-| Claude Code | sandbox bridge | ❌ | ✅ | ✅ |
-| Deep Agents | sandbox bridge | ❌ | ✅ | ✅ |
-| OpenCode | sandbox bridge | ❌ | ✅ | ✅ |
-| **Codex** | sandbox bridge | ❌ | **❌** | ✅ |
-| Cursor | sandbox via ACP | ❌ | ✅ | ❌ |
-| fx | sandbox via ACP | ❌ | ✅ | ❌ |
-| Grok Build | sandbox via ACP | ❌ | ✅ | ✅ |
+根本没有可供 `wrapLanguageModel` 包装的模型对象 —— **9 个适配器一律 `costVisibility: 'per-turn'`**，
+连 host-process 的 Cline、Pi 也不例外。问题不在沙箱，在于**模型调用整体归 harness 所有**。
 
-一致性测试只需各取一个代表（**Pi** 代表 host process、**Claude Code** 代表 sandbox）即可覆盖两类。
-9 个适配器中只有 **Codex 没有原生审批** → 它的 `suspend` 为 `'none'`（§4.7）。
+好消息是 usage 有上报：适配器会把 `result.usage` 归一化成 AI SDK 的形状，
+因此 **turn 级记账与轮间预算闸门可行**（跑完一轮结账，超预算就不发起下一轮）。
+
+#### 工具拦截按来源分，不是一个布尔量
+
+harness 的工具有两个来源，拦截能力完全不同：
+
+| 工具来源 | 谁执行 | 我们拦得到吗 |
+|---|---|---|
+| **内建工具**（读写文件、跑命令等） | harness 运行时自己执行 | ❌ |
+| **host-declared 工具**（我们用 AI SDK `tool()` 传进去的） | 「`HarnessAgent` executes the tool in your host」 | ✅ |
+
+所以 harness 一律 `toolInterception: 'host-declared-only'`：`effectful` 策略**只能声明在 host-declared 工具上**。
+对内建工具的副作用防护只能依赖 harness 自己的 approval 机制与沙箱隔离——我们不提供，也不假装提供。
+
+#### 修正后的适配器能力表（依据 `ai@7.0.93`）
+
+| 适配器 | 工具运行位置 | `costVisibility` | `toolInterception` | 原生审批 | 结构化输出 |
+|---|---|---|---|---|---|
+| Cline | host process | per-turn | host-declared-only | ✅ | ✅ |
+| Pi | host process | per-turn | host-declared-only | ✅ | ❌ |
+| Claude Code | sandbox bridge | per-turn | host-declared-only | ✅ | ✅ |
+| Deep Agents | sandbox bridge | per-turn | host-declared-only | ✅ | ✅ |
+| OpenCode | sandbox bridge | per-turn | host-declared-only | ✅ | ✅ |
+| **Codex** | sandbox bridge | per-turn | host-declared-only | **❌** | ✅ |
+| Cursor | sandbox via ACP | per-turn | host-declared-only | ✅ | ❌ |
+| fx | sandbox via ACP | per-turn | host-declared-only | ✅ | ❌ |
+| Grok Build | sandbox via ACP | per-turn | host-declared-only | ✅ | ✅ |
+
+对比：`ai-sdk/tool-loop` 是 `costVisibility: 'per-call'` + `toolInterception: 'all'` + `granularity: 'step'`。
+
+一致性测试各取一个代表即可：**Pi**（host process）与 **Claude Code**（sandbox）。
+9 个里只有 **Codex 没有原生审批** → `suspend: 'none'`（§4.7）。
 
 #### 能力—配置一致性校验
 
@@ -407,14 +436,17 @@ interceptTools = (runtimeLocation === 'host-process')
 
 | 情况 | core 的处理 |
 |---|---|
-| `interceptModel: false` | **拒绝启动**——journal 形同虚设，用户会误以为有成本保护 |
-| `interceptTools: false` 且 spec 声明了 `effectful` 工具 | **拒绝启动**——幂等保护实际不存在 |
-| `interceptTools: false` 且工具策略均为 `pure` | 允许；journal 退化到 turn 级，恢复改用引擎自己的 session resume state |
+| `costVisibility: 'none'` | **拒绝启动**——完全看不见成本 |
+| `costVisibility: 'per-turn'` | 允许；预算改为**轮间闸门**（跑完一轮结账，超了不发起下一轮），并告警「单轮内可能超支」 |
+| `toolInterception: 'none'` 且 spec 有 `effectful` 工具 | **拒绝启动**——幂等保护不存在 |
+| `toolInterception: 'host-declared-only'` 且 `effectful` 声明在**内建工具**上 | **拒绝启动**——那个工具我们碰不到 |
+| `state: 'engine-session'` | 允许；避免重复付费改由引擎的 session resume 负责，我们的 journal 只负责持久化它 |
 | `suspend: 'none'` 且 spec 声明了 `approval` | **拒绝启动**——不能让它跑到一半才发现停不下来 |
 | `sliceControl: 'none'` | 允许；一轮 = 一分片，由引擎的 turn 自然边界决定（§5.3） |
+| `progress: 'none'` | 允许；进展退化到只在分片边界上报（§10.4） |
 
 > 这是本设计里最容易被省略、也最不该省略的部分。宣称"支持任意 SDK"而不说清能力差异，
-> 会让用户在 sandbox 型 harness 上误以为拿到了 effectively-once。
+> 会让用户在 harness 上误以为拿到了 effectively-once 与调用级成本管控。
 
 ### 4.5 core 不定义统一消息格式
 
@@ -587,8 +619,10 @@ AI SDK 侧的翻译很自然：`stopWhen` 支持自定义谓词，且判定发�
 | `idempotent` | 重跑，注入 `idempotencyKey = stepId` |
 | `effectful` | 只有 `tool.intent` 无 `tool.result` 时按 `onAmbiguousReplay`：`fail`（默认）/ `retry` / `probe` |
 
-⚠️ `interceptTools: false` 的引擎（sandbox 型 harness）**无法提供这层保护**，
-core 在启动时拒绝这类 spec 声明 `effectful` 策略（§4.4）。
+⚠️ 保护范围受 `toolInterception` 限制（§4.4）：
+`'host-declared-only'` 的引擎（全部 harness 适配器）只能保护**我们自己声明的工具**；
+引擎的内建工具（读写文件、跑命令）我们碰不到，`effectful` 声明在它们上面会被**启动时拒绝**。
+那类工具的副作用防护只能依赖引擎自己的 approval 机制与沙箱隔离。
 
 ---
 
@@ -741,6 +775,9 @@ worker 侧指标用官方 SDK 的 Prometheus 采集。本项目补 Agent 语义�
 token & cost（按 model / tenant / spec / **engine**）、replay 命中率、工具成功率、
 护栏拦截率、fence 抢占次数、预算触顶次数、能力降级次数。
 
+进展通道自身的健康度（§10.4）：task log 写入失败率、被节流丢弃的进展条数、
+`progress: 'none'` 的降级次数。
+
 两个专门用于调 `sliceMs` 的观测量（§15.3 第 3 条）：
 **平均分片数 / run** 与 **journal 字节数 / run** —— 分片切得多细、代价多大，得有数才好调。
 
@@ -749,6 +786,84 @@ token & cost（按 model / tenant / spec / **engine**）、replay 命中率、�
 `StreamSink` 把模型 delta 与工具事件推到 Redis Stream / SSE 网关，
 channel key = `workflowInstanceId:taskReferenceName`（跨分片稳定）。
 AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
+
+### 10.4 进展反馈：让编排引擎在运行中就知道进度
+
+**要解决的问题**：一个 Agent task 可能跑十几分钟。如果只有跑完才回写结果，
+运维在 Conductor UI 上看到的就是一个"卡了十几分钟"的任务，无法区分「正常在跑」与「卡死了」；
+工作流里的其他环节也无从知道它到哪一步了。
+
+**必须先划清三种输出**，它们的通道、频率、可靠性要求完全不同：
+
+| | 内容 | 通道 | 频率 |
+|---|---|---|---|
+| 实时输出 | token delta、工具入参出参全文 | `StreamSink`（Redis Stream / SSE，§10.3） | 高频、无界 |
+| **进展** ← 本节 | 到第几步、当前在做什么、累计 token 与成本 | **`outputData.progress` + Conductor Task Log** | 低频、有界 |
+| 最终结果 | 结构化输出 | `outputData` | 一次 |
+
+**进展不是把实时输出流转发给 Conductor。** 把 token 流写进 task log 会瞬间打爆服务端，
+而且那不是编排引擎该消费的东西——编排引擎要的是「它还活着、走到哪了」，不是「它说了什么」。
+
+#### 进展的内容
+
+```ts
+interface ProgressReport {
+  /** 语义化阶段名，由引擎适配器映射（如 'planning' | 'tool:lookupPolicy' | 'finalizing'） */
+  phase: string;
+  /** 已完成的受管调用数 */
+  step: number;
+  /** 若可预知（plan-execute 类引擎）才有 */
+  totalSteps?: number;
+  usage: { tokens: number; costUsd: number };
+  sliceIndex: number;
+  updatedAt: number;
+}
+```
+
+产生源就是已有的两个受管入口 + 分片边界，**不需要引擎额外配合**；
+引擎若有更语义化的原生回调（AI SDK 的 `onStepFinish`、harness 的 lifecycle callbacks），
+适配器可以把 `phase` 填得更好。`capabilities.progress` 声明能到 `'step'` 还是只有 `'turn'`。
+
+#### 两条通道，可靠性不同
+
+**通道一：`outputData.progress`（权威、可靠）**
+
+`callback` 分片交还本身就是一次 task update —— 顺手把 `progress` 写进 `outputData`，
+**零额外请求**。这是唯一能被工作流消费的通道：其他 task 可以读
+`${agent_ref.output.progress.step}` 做 SWITCH 分支、超时告警或通知。
+
+**通道二：Conductor Task Log（尽力而为、给人看）**
+
+`POST /api/tasks/{taskId}/log`（官方 SDK 的 `getTaskContext()?.addLog()`），
+好处是**分片内也能写**，不必等到交还。但源码核实发现三条硬约束，必须按它们设计：
+
+| 约束（v3.21.21 源码） | 影响 |
+|---|---|
+| `ExecutionDAOFacade.addTaskExecLog()` 先判 `isTaskExecLogIndexingEnabled()`，再写 `indexDAO` | 部署若用 `NoopIndexDAO`（`conductor.indexing.enabled=false`，无 ES/OpenSearch 的常见 OSS 配置），**日志被静默丢弃** |
+| `taskExecLogSizeLimit` 默认 **10** | **单次调用**超过 10 条会被静默截断（只保留前 10 条），不是每任务上限 |
+| `asyncIndexingEnabled` 默认 `false` | 索引写在请求路径上，写太频会拖慢服务端 |
+
+**所以 task log 只能当作 UI 上的镜像，不能作为进展的权威来源。**
+进展的真相在 `outputData.progress` 与 journal 里；task log 丢了不算故障。
+
+#### 写入策略
+
+- **节流**：默认 `progressIntervalMs = 15_000`；阶段变化（`phase` 变了）立即写一次（leading edge），
+  两者取或。窗口内的多次进展合并成最后一条。
+- **批量**：单次 `addLog` 调用**不超过 10 条**（上表约束 2），超出的丢弃前面的、保留最新的。
+- **总量上限**：单个 run 默认最多 200 条 task log，超限后只写阶段变化。
+- **异步 fire-and-forget**：写失败只记本地日志，不影响主流程，不重试到底。
+- **内容规范**：一行结构化文本，截断到 512 字符，**不放 payload、不放工具入参出参、不放任何密钥**。
+  例：`[3/12] tool:lookupPolicy · 12.4k tok / $0.031 · slice 2`
+- **启动自检**：探测部署是否启用了 task log 索引；未启用则**告警一次**并自动关闭通道二，
+  避免用户以为写了其实什么都没有。
+
+#### 跨重试的连续性
+
+task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片之间日志是连续的；
+但 responseTimeout → `TIMED_OUT` → 重试会换新 `taskId`，日志就断了。
+因此进展**同时写 journal**，新 `taskId` 的第一条 log 输出一句
+「从第 N 步恢复（累计 X tokens / $Y）」把断点接上。
 
 ---
 
@@ -762,6 +877,7 @@ AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
 | 并发 | 双 worker 抢同一 runKey → 断言 fence 生效 |
 | 分片 | 强制大量分片 → 断言与单片执行结果一致 |
 | Spec | 合并语义快照测试；effective spec 的黄金文件 |
+| 进展 | 断言节流生效、单次 `addLog` ≤ 10 条、task log 索引关闭时自动降级且只告警一次、跨 `taskId` 重试后有续接摘要（§10.4） |
 | 集成 | docker-compose 起真实 Conductor OSS（3.21.x，另跑 3.10.6 验证版本探测降级） |
 
 **引擎一致性套件是最重要的测试资产**：它把「支持任意 SDK」从口号变成可验证的契约。
@@ -813,9 +929,9 @@ AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + `@ca/engine-ai-sdk` + Conductor 桥接 | `minimal-agent` 在 Conductor OSS 3.21.21 上端到端跑通，含跨分片恢复 |
+| **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + `@ca/engine-ai-sdk` + Conductor 桥接 + **进展反馈两通道（§10.4）** | `minimal-agent` 在 Conductor OSS 3.21.21 上端到端跑通，含跨分片恢复；运行中在 Conductor UI 能看到进度 |
 | **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
-| **M3** 多引擎 | `@ca/engine-harness`（sandbox 型能力降级路径）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；harness 的能力缺失被正确拒绝/降级；**逐个适配器实测出 `interceptModel` 结论**（§15.3 第 1 条）并定下长 turn 的处理方式（第 2 条） |
+| **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效；定下长 turn 的处理方式（§15.3 第 1 条） |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
 | **M5** 生态与交互 | HITL（native-approval 全链路）、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
 | **M6** 生产化 | OTel、Agent 语义指标、预算治理、多租户、CLI 完善、文档站 | 压测报告 + 运维手册 |
@@ -846,6 +962,7 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | [0015](adr/0015-slice-budget-negotiation.md) | 分片边界：core 给预算、引擎翻译 | Accepted |
 | [0016](adr/0016-resume-decision-from-journal.md) | 用自己的 journal 终态区分崩溃与业务失败 | Accepted |
 | [0017](adr/0017-engine-contract-version.md) | 引擎契约版本与领域包兼容 | Accepted |
+| [0018](adr/0018-progress-reporting.md) | 进展反馈双通道：`outputData.progress` 权威 + Task Log 尽力而为 | Accepted |
 
 ---
 
@@ -854,39 +971,39 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 > v0.4 重写文档时遗漏了 v0.3 记录的 4 条 Conductor 侧遗留问题（它们并未解决，只是从文档里消失）。
 > v0.5 已全部补回并处理。
 
-### 15.1 本轮关闭的（6 条）
+### 15.1 已关闭（7 条）
 
 | 原问题 | 结论 | 出处 |
 |---|---|---|
-| `WorkflowSweeper` 实际扫描周期未知，影响 `sliceMs` / `responseTimeoutSeconds` 取值 | 检测延迟 ≈ `responseTimeoutSeconds + 1s`；且该值同时决定重扫频率，故加 30s 下限 | §2.2、§6.6 |
+| `WorkflowSweeper` 实际扫描周期未知 | 检测延迟 ≈ `responseTimeoutSeconds + 1s`；该值同时决定重扫频率，故加 30s 下限 | §2.2、§6.6 |
 | `callbackAfterSeconds` 是否有服务端上限 | **无上限**，只做下限钳制；天花板只有 `timeoutSeconds` | §2.2 |
 | `retryCount` 分不清租约超时重试与业务重试 | 改看自己的 journal 终态，不再从 `retryCount` 反推 | §5.2、ADR-0016 |
-| sandbox 型 harness 的工具拦截能力需逐个核实 | 由 `runtimeLocation` 机械推导，附 9 个适配器能力表 | §4.4 |
+| sandbox 型 harness 的工具拦截能力 | 按**工具来源**分：host-declared 拦得到、内建工具拦不到 → `toolInterception: 'host-declared-only'` | §4.4 |
 | `replay-signal` 挂起路径是否可靠 | **删除**。9 个适配器中 8 个有原生审批，为 1/9 保留最脆的机制不划算 | §4.7、ADR-0014 |
-| `EngineTurn.continue` 的切分时机由谁决定 | core 给 `sliceBudget`，引擎翻译成原生停止条件；新增 `sliceControl` 能力位 | §5.3、ADR-0015 |
+| `EngineTurn.continue` 的切分时机由谁决定 | core 给 `SliceBudget`，引擎翻译成原生停止条件 | §5.3、ADR-0015 |
+| **harness 的 `interceptModel`（v0.5 第 1 条）** | **全部拦不到，且与沙箱无关** —— `HarnessAgent` 的 `model` 是 harness 专属字符串，不存在可包装的模型对象。改用 `costVisibility: 'per-turn'` + 轮间预算闸门，不再触发拒绝启动 | §4.4 |
 
 ### 15.2 已定方案、随里程碑落地的（2 条）
 
 | 问题 | 方案 | 何时 |
 |---|---|---|
-| 上游 AI SDK 演进快，适配器易碎 | 只依赖 3 个稳定 API 面；CI 只跑 `latest` + peerDep 下界；一致性套件当 canary | M2 |
+| 上游 AI SDK 演进快，适配器易碎 | 只依赖 3 个稳定 API 面；CI 只跑 `latest` + peerDep 下界（现为 `ai@^7.0.0`）；一致性套件当 canary | M2 |
 | 领域包被引擎升级打穿 | 引擎契约版本（我们自己维护的版本号），Pack 声明兼容范围 | M4，接口在 M1 就位 |
 
 ### 15.3 仍然开放的（3 条）
 
-1. **sandbox 型 harness 的 `interceptModel` 尚未确认**。
-   §4.4 的能力表给出了**工具**的运行位置，但没有说明**模型调用**发生在哪。
-   sandbox bridge 型（Claude Code / Codex / Deep Agents / OpenCode）的模型调用很可能也在沙箱内 ——
-   若如此，成本归集与预算治理只能依赖 harness 自身上报，`interceptModel: false` 会直接触发 §4.4 的拒绝启动规则。
-   **需逐个适配器实测后如实声明**；这决定了 `@ca/engine-harness` 到底能不能纳入预算治理。M3 前必须有结论。
-
-2. **`sliceControl: 'none'` 的引擎如何避免撞上 `timeoutSeconds`**。
+1. **`sliceControl: 'none'` 的引擎如何避免撞上 `timeoutSeconds`**。
    一轮 = 一分片意味着分片时长完全由引擎决定。若某个 harness 的单个 turn 跑了 20 分钟，
    我们既不能中途停它，也无法提前知道它要多久，只能事后发现总时长超了 `timeoutSeconds`。
-   候选方案：(a) 为这类引擎把 `timeoutSeconds` 按最坏情况放大；
-   (b) 用 `AbortSignal` 硬超时中断并接受状态丢失；(c) 只在 spec 显式声明"允许长 turn"时才准许这类引擎。
-   倾向 (c) + (a)，M3 随 harness 适配一起定。
+   候选：(a) 为这类引擎把 `timeoutSeconds` 按最坏情况放大；(b) 用 `AbortSignal` 硬超时中断并接受状态丢失；
+   (c) 只在 spec 显式声明「允许长 turn」时才准许这类引擎。倾向 (c) + (a)，M3 随 harness 适配一起定。
+
+2. **`costVisibility: 'per-turn'` 下的超支敞口有多大**。
+   轮间闸门只能在**一轮结束后**结账，单轮内烧掉多少完全不可控。
+   对 harness 这类可能跑很久的引擎，一轮就可能超预算数倍。
+   需要在 M3 用真实 harness 量出「单轮成本分布」，再决定是否要求这类 spec 必须设更保守的 `maxCostUsd`，
+   或干脆禁止把 harness 用在成本敏感场景。
 
 3. **`callback` 分片的 journal 写放大与存储成本**。
-   每个分片一次持久化，切得越碎写得越多。需在 M2 压测中按 `sliceMs` 量化并给出选型表。
-   先定默认 `sliceMs = 60s`，并在指标里暴露两个直接观测量：**平均分片数/run**、**journal 字节数/run**（§10.2）。
+   每个分片一次持久化，切得越碎写得越多。M2 压测中按 `sliceMs` 量化并给出选型表。
+   先定默认 `sliceMs = 60s`，指标暴露**平均分片数/run**与**journal 字节数/run**（§10.2）。

@@ -11,9 +11,12 @@
  * - contendRunKey()：双 worker 抢同一 runKey，断言 fence 生效且只有一次成功回写
  * - engineConformance()：对每个 AgentEngine（含用户自建）跑同一套契约测试 ——
  *   受管入口是否真的被全部调用、replay 是否幂等、suspended→恢复是否正确、
- *   **声明的 capabilities 是否与实际行为一致**（防止适配器谎报能力，§11）。
+ *   **声明的 capabilities 是否与实际行为一致**（防止适配器谎报能力，§11）——
+ *   包括 costVisibility 与 toolInterception 两个分级是否名副其实。
  *   既是我们的回归，也是引擎作者的验收工具
  * - sliceHarness()：sliceMs 设为极小值强制大量分片，断言结果与单片执行一致
+ * - progressHarness()：断言节流生效、单次 addLog ≤ 10 条（服务端会静默截断）、
+ *   task log 索引关闭时自动降级且只告警一次、跨 taskId 重试后有续接摘要（§10.4）
  * - packCompatibility()：校验领域包声明的 engines 契约版本范围与引擎实际 contractVersion
  *   匹配（ADR-0017）；同时把关「改了 Pack 可见的形状必须 +1」这条纪律 ——
  *   没有它，那层版本保护就是假的

@@ -19,6 +19,11 @@ export interface ResultMapperOptions {
 /** 返回值形状对齐官方 ConductorWorker.execute 的 TaskResult */
 export interface MappedTaskResult {
   status: 'COMPLETED' | 'IN_PROGRESS' | 'FAILED';
+  /**
+   * 分片交还时除了业务字段，还带 progress（ADR-0018 的权威通道）与 specHash：
+   *   { ok?, result?, progress?, specHash, usage, slices, traceId, transcriptRef }
+   * 工作流可读 ${agent_ref.output.progress.step} 做分支或告警。
+   */
   outputData?: Record<string, unknown>;
   callbackAfterSeconds?: number;
   reasonForIncompletion?: string;
