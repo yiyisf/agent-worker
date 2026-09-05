@@ -99,8 +99,9 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 | [docs/architecture.md](docs/architecture.md) | 完整技术架构设计 |
 | [§3.1 核心洞察](docs/architecture.md#31-核心洞察可靠性不需要拥有循环) | 为什么 core 可以这么薄 |
 | [§4.4 能力边界](docs/architecture.md#44-enginecapabilities--诚实的能力边界) | 不同引擎的能力差异与校验 |
-| [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2 与 SpecLoader |
-| [docs/adr/](docs/adr/) | 13 条决策记录（含 3 条被后续推翻/修订的） |
+| [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2、SpecLoader、引擎契约版本 |
+| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 6 条、已定方案 2 条、仍开放 3 条 |
+| [docs/adr/](docs/adr/) | 17 条决策记录（含 3 条被后续推翻、2 条被修订的） |
 
 ## 仓库结构
 

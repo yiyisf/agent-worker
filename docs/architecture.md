@@ -1,16 +1,22 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
-> 状态：Draft v0.4 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
+> 状态：Draft v0.5 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
 >
-> **v0.4 变更（Agent 层重构；Conductor 对接层已对齐，本轮不动）**
-> 1. `@ca/core` 从「拥有循环的厚运行时」重构为「**薄契约层 + 可靠性内核**」（§3、§4）。
-> 2. 自研的 `AgentStrategy` 循环范式**取消**，改为可插拔 `AgentEngine` 适配现成 SDK
->    （[ADR-0011](adr/0011-agent-engine-over-strategy.md)）。
-> 3. 可靠性改由**拦截**实现而非拥有循环：`ManagedModelGateway` + `ManagedToolGateway`
->    （[ADR-0012](adr/0012-reliability-by-interception.md)）。
-> 4. 新增可 JSON 序列化的 `AgentSpec` 与 L0/L1/L2 三层配置组合，支撑「通用配置化 + 领域定制」
->    （[ADR-0013](adr/0013-agent-spec-and-domain-packs.md)）。
-> 5. 删除 `@ca/providers-*` 与 `@ca/tools-mcp` 三个包——AI SDK 的 provider 生态与 `@ai-sdk/mcp` 已覆盖。
+> **v0.5 变更（清理遗留问题：9 条中关闭 6 条、定案 3 条）**
+> 1. §2.2 补两条服务端事实：崩溃检测延迟 ≈ `responseTimeoutSeconds + 1s`，且**该值同时决定
+>    Conductor 扫描这个工作流的频率**；`callbackAfterSeconds` 无服务端上限。
+> 2. §4.4 能力模型细化：`interceptTools` 由适配器的**运行位置**机械推导，附 9 个 harness 的能力表。
+> 3. §4.7 **删除 `replay-signal` 挂起路径**，挂起只走引擎原生审批
+>    （[ADR-0014](adr/0014-native-approval-only-suspension.md)）。
+> 4. §4.4 / §5.3 新增 `sliceControl`：分片边界由 core 给预算、引擎翻译成原生停止条件
+>    （[ADR-0015](adr/0015-slice-budget-negotiation.md)）。
+> 5. §5.2 恢复判据改为**看自己的 journal 终态**，不再从 Conductor 的 `retryCount` 推断
+>    （[ADR-0016](adr/0016-resume-decision-from-journal.md)）。
+> 6. §7.3 新增**引擎契约版本**，把版本耦合收敛到自己控制的一层
+>    （[ADR-0017](adr/0017-engine-contract-version.md)）。
+> 7. §6.6 `responseTimeoutSeconds` 加下限 30s；§15 补回 v0.4 重写时遗漏的 Conductor 侧遗留问题。
+>
+> v0.4 的重构（薄 core、`AgentEngine`、拦截式可靠性、`AgentSpec`）不变，见 ADR-0011～0013。
 
 ---
 
@@ -78,8 +84,33 @@
   等待时间被计入容忍窗口，故 `callbackAfterSeconds` **无需**小于 `responseTimeoutSeconds`。
 - `timeoutSeconds` 从 `startTime` 起算且**不加** callbackTime → 真正约束是
   **Σ(所有分片执行 + 所有等待) < `timeoutSeconds`**。
-- 检查在 `decide()` 内由 `WorkflowSweeper` 周期触发，检测有粒度延迟。
 - `extendLease` 真心跳自 **v3.10.7** 起可用（v3.10.6 无）；`callbackAfterSeconds` 3.x 全系可用。
+- **`callbackAfterSeconds` 没有服务端上限**：`ExecutionService.requeue()` 只做下限钳制
+  （`< 0 → 0`）并扣除已过去的时间，不校验上限。真正的天花板只有 `timeoutSeconds`。
+
+#### 崩溃检测延迟 ≈ `responseTimeoutSeconds + 1s`，且它同时是扫描频率
+
+超时检查发生在 `decide()` 内，由 `WorkflowReconciler` 驱动：
+
+```java
+// WorkflowReconciler
+@Scheduled(fixedDelayString = "${conductor.sweep-frequency.millis:500}")   // 默认 500ms 一轮
+queueDAO.pop(DECIDER_QUEUE, sweeperThreadCount /* = CPU×2 */, sweeperWorkflowPollTimeout /* 2000ms */);
+
+// WorkflowSweeper.unack()：扫完之后，决定多久再来看这个工作流一次
+postponeDurationSeconds = task.getResponseTimeoutSeconds() != 0
+        ? task.getResponseTimeoutSeconds() + 1     // ← 工作流有 IN_PROGRESS 任务时
+        : workflowOffsetTimeout;                   // 默认 30s
+// 上限 maxPostponeDurationSeconds，默认 3600s
+queueDAO.setUnackTimeout(DECIDER_QUEUE, workflowId, postponeDurationSeconds * 1000);
+```
+
+两个结论：
+
+1. **检测延迟 ≈ `responseTimeoutSeconds + 1s`**（再加队列排队），既不是 500ms 也不是无界。
+2. ⚠️ **`responseTimeoutSeconds` 同时决定 Conductor 重新扫描这个工作流的频率**。
+   把它调小以求"更快发现崩溃"会成比例加重 decider 负载：设成 10s，该工作流就每 11s 被扫一次；
+   1000 个并发工作流即每秒多出约 90 次扫描。因此 §6.6 给它加了 **30s 下限**。
 
 ---
 
@@ -327,10 +358,14 @@ const tools = mapValues(userTools, (t, name) => ({
 
 ```ts
 interface EngineCapabilities {
+  /** 引擎的代码在哪运行 —— interceptTools 由它机械推导，见下 */
+  runtimeLocation: 'host-process' | 'sandbox';
   /** 跨分片的状态如何保存 */
   state: 'messages' | 'snapshot' | 'engine-session' | 'replay';
-  /** 挂起机制 */
-  suspend: 'native-approval' | 'replay-signal' | 'none';
+  /** 挂起机制。v0.5 删除了 replay-signal，见 ADR-0014 */
+  suspend: 'native-approval' | 'none';
+  /** 分片边界：引擎能否接受 core 给的 sliceBudget 并翻译成原生停止条件（ADR-0015） */
+  sliceControl: 'native' | 'none';
   /** 能否拦截模型调用 —— 决定 journal 能否覆盖 LLM 成本 */
   interceptModel: boolean;
   /** 能否拦截工具执行 —— 决定幂等与副作用保护是否有效 */
@@ -342,15 +377,43 @@ interface EngineCapabilities {
 }
 ```
 
-启动时做**能力—配置一致性校验**，不满足则拒绝启动或显式降级并告警。几个真实例子：
+#### `interceptTools` 不靠逐个试，靠运行位置推导
 
-| 引擎 | 能力实况 | core 的处理 |
-|---|---|---|
-| `ai-sdk/tool-loop` | 全绿，`state: 'messages'`，`granularity: 'step'`，`suspend: 'native-approval'` | 完整能力 |
-| `ai-sdk/harness`（Claude Code / Codex 等） | 工具在 **sandbox 内**执行 → `interceptTools: false`，`granularity: 'turn'`，`state: 'engine-session'` | **拒绝**声明了 `effectful` 工具策略的 spec；journal 退化到 turn 级；恢复改用 harness 自己的 session resume state |
-| 自定义引擎未接受管入口 | `interceptModel: false` | 拒绝启动——否则 journal 形同虚设，用户会误以为有成本保护 |
+```
+interceptTools = (runtimeLocation === 'host-process')
+```
 
-> 这条是本设计里最容易被省略、也最不该省略的部分。宣称"支持任意 SDK"而不说清能力差异，
+工具跑在我们自己进程里就拦得住，跑在沙箱里就拦不住。AI SDK 的 harness 适配器能力表直接给出了运行位置，
+照抄成适配器里的常量即可（下表按官方文档整理，随 AI SDK 更新时同步）：
+
+| 适配器 | 运行位置 | `interceptTools` | 原生审批 | 结构化输出 |
+|---|---|---|---|---|
+| Cline | host process | ✅ | ✅ | ✅ |
+| Pi | host process | ✅ | ✅ | ❌ |
+| Claude Code | sandbox bridge | ❌ | ✅ | ✅ |
+| Deep Agents | sandbox bridge | ❌ | ✅ | ✅ |
+| OpenCode | sandbox bridge | ❌ | ✅ | ✅ |
+| **Codex** | sandbox bridge | ❌ | **❌** | ✅ |
+| Cursor | sandbox via ACP | ❌ | ✅ | ❌ |
+| fx | sandbox via ACP | ❌ | ✅ | ❌ |
+| Grok Build | sandbox via ACP | ❌ | ✅ | ✅ |
+
+一致性测试只需各取一个代表（**Pi** 代表 host process、**Claude Code** 代表 sandbox）即可覆盖两类。
+9 个适配器中只有 **Codex 没有原生审批** → 它的 `suspend` 为 `'none'`（§4.7）。
+
+#### 能力—配置一致性校验
+
+启动时校验，不满足则拒绝启动或显式降级并告警：
+
+| 情况 | core 的处理 |
+|---|---|
+| `interceptModel: false` | **拒绝启动**——journal 形同虚设，用户会误以为有成本保护 |
+| `interceptTools: false` 且 spec 声明了 `effectful` 工具 | **拒绝启动**——幂等保护实际不存在 |
+| `interceptTools: false` 且工具策略均为 `pure` | 允许；journal 退化到 turn 级，恢复改用引擎自己的 session resume state |
+| `suspend: 'none'` 且 spec 声明了 `approval` | **拒绝启动**——不能让它跑到一半才发现停不下来 |
+| `sliceControl: 'none'` | 允许；一轮 = 一分片，由引擎的 turn 自然边界决定（§5.3） |
+
+> 这是本设计里最容易被省略、也最不该省略的部分。宣称"支持任意 SDK"而不说清能力差异，
 > 会让用户在 sandbox 型 harness 上误以为拿到了 effectively-once。
 
 ### 4.5 core 不定义统一消息格式
@@ -388,11 +451,12 @@ interface ToolPolicy {
 未在 `toolPolicies` 中声明的工具默认按 `pure` 处理并发出运行时告警；
 `strictPolicies: true` 下拒绝注册未声明策略的工具。
 
-### 4.7 挂起（HITL / 等待外部）的两条通用路径
+### 4.7 挂起（HITL / 等待外部）：只走引擎原生审批
 
-跨引擎的难点：**我们无法暂停别人的循环**。core 支持两种机制，由 `capabilities.suspend` 决定：
+跨引擎的难点：**我们无法暂停别人的循环**。v0.4 曾设计两条路径，v0.5 只保留一条
+（[ADR-0014](adr/0014-native-approval-only-suspension.md)）。
 
-**A. `native-approval`（首选）** —— 引擎自己支持两段式审批。
+**`native-approval`（唯一路径）** —— 引擎自己支持两段式审批。
 AI SDK 的 tool approval 正是如此：第一次 `generate()` 返回 `tool-approval-request` 并结束本轮，
 外部决策后把 `tool-approval-response` 追加进 messages 再跑一次。
 
@@ -407,12 +471,13 @@ engine.run()  → { kind:'suspended', state: messages, awaiting: { approvalId, .
 **这与 Conductor 的 callback 分片是同构的**——AI SDK 的两段式审批天然落在我们的分片边界上，
 不需要任何 hack。
 
-**B. `replay-signal`（兜底）** —— 引擎不支持原生审批时。
-`ManagedToolGateway.guard` 抛出 `SuspendSignal`，异常冒泡出引擎循环，core 在边界捕获、
-持久化 journal、交还任务；恢复时重放到同一工具调用，这次从 journal / 审批存储**直接返回结果**而不再抛出。
+**`none`** —— 引擎不支持原生审批（9 个 harness 适配器里只有 Codex 属于此类）。
+这类引擎**不支持 HITL**：spec 里若声明了 `approval`，**启动时**就拒绝，而不是跑到一半才发现停不下来。
 
-代价：引擎循环内不在 journal 中的中间状态会丢失，靠重放重建。因此 B 要求 `state: 'replay'`
-且引擎循环相对纯净。**能用 A 就不要用 B。**
+> **为什么删掉了 v0.4 的 `replay-signal` 兜底路径**：它的做法是在受管工具入口抛异常、
+> 炸开引擎的调用栈来强行中断，再靠重放恢复。「在别人的代码里扔异常，由别人决定怎么接」
+> 本身就不可控，是整个设计里最脆的一环；而实测 9 个适配器中 8 个都有原生审批，
+> 为 1/9 的场景保留它不划算。详见 [ADR-0014](adr/0014-native-approval-only-suspension.md)。
 
 ### 4.8 `RunContext`
 
@@ -460,6 +525,21 @@ runKey = `${workflowInstanceId}:${taskReferenceName}:${epoch}`
 
 `resumePolicy`：`on-lease-loss`（默认，epoch 恒为 0）/ `fresh-per-retry`（epoch = `retryCount`）/ `never`。
 
+#### 「崩溃了」与「真失败了」用自己的 journal 区分
+
+一个任务失败重来时要判断：worker **进程崩了**（该接着上次跑，别浪费已花掉的 token），
+还是**业务上真失败了**（该从头重来）。Conductor 的 `retryCount` 两种情况都 +1，分不出来——
+这是 v0.3 起就悬着的问题。
+
+**不必从 `retryCount` 反推，看我们自己的 journal 就有答案**（[ADR-0016](adr/0016-resume-decision-from-journal.md)）：
+
+| 上一次尝试的 journal | 说明 | 处理 |
+|---|---|---|
+| 没有终态条目（无 `final`、无 `tool.error` 收尾） | worker 半路没了：崩溃、被 kill、或租约超时 | **续跑**（重放已有 journal） |
+| 有终态条目 | 正常跑完并判定失败，由 Conductor 按 `retryCount` 重试 | 按 `resumePolicy` 决定是否重开 |
+
+判据完全在自己手里，不依赖 Conductor 的重试语义。
+
 ### 5.3 租约策略（v0.3 已对齐，未改动）
 
 默认 **`callback`** 分片执行：每轮 `engine.run()` 结束后持久化状态，
@@ -470,7 +550,34 @@ runKey = `${workflowInstanceId}:${taskReferenceName}:${epoch}`
 落后者被拒绝并自我放弃。
 
 > `callback` 与 `EngineTurn` 的 `continue` / `suspended` 是同一件事的两面：
-> 引擎交还一轮，桥接层就交还一个 Conductor 分片。这是 v0.4 契约设计的核心对齐点。
+> 引擎交还一轮，桥接层就交还一个 Conductor 分片。这是契约设计的核心对齐点。
+
+#### 分片边界由谁决定：core 给预算，引擎翻译
+
+三种做法，v0.5 定第三种（[ADR-0015](adr/0015-slice-budget-negotiation.md)）：
+
+| 做法 | 问题 |
+|---|---|
+| core 掐表强行打断引擎 | 相当于别人跑步时把他拽住，引擎内部状态是断的，存不下来也续不上 |
+| 引擎自由裁量 | 各家标准不一，成本与时间无法统一治理 |
+| **core 给 `sliceBudget`，引擎翻译成原生停止条件** | ✅ |
+
+```ts
+interface SliceBudget {
+  /** 本分片的墙钟预算，默认 limits.sliceMs（60s） */
+  wallClockMs: number;
+  /** 本分片最多允许多少次受管模型调用 */
+  maxModelCalls: number;
+  /** 本分片最多允许多少次受管工具执行 */
+  maxToolCalls: number;
+}
+```
+
+AI SDK 侧的翻译很自然：`stopWhen` 支持自定义谓词，且判定发生在「最后一步有工具结果」——
+正是干净的边界；停下后 `response.messages` 直接就是可续跑的状态。
+
+`sliceControl: 'none'` 的引擎（如 harness 的一个 turn 不可中途拆分）则是
+**一轮 = 一分片**，由 turn 的自然边界决定；此时 `sliceBudget` 仅作为超限告警的依据，不强制。
 
 ### 5.4 副作用与幂等
 
@@ -497,6 +604,9 @@ core 在启动时拒绝这类 spec 声明 `effectful` 策略（§4.4）。
 - **6.4 CancellationWatcher**：轮询 workflow 状态 → `AbortSignal`（Conductor 不推送取消）。
 - **6.5 准入控制**：令牌预算反压动态调节官方 `TaskManager` 的 concurrency。
 - **6.6 TaskDef 推导**：`retryCount` 不可为 0；`timeoutSeconds` 必须覆盖「所有分片执行 + 所有等待」。
+  **v0.5 新增下限**：`responseTimeoutSeconds = max(30, ceil(sliceMs/1000 × 3))`。
+  下限的理由是 §2.2 那条耦合——该值同时决定 Conductor 重扫这个工作流的频率，调小会成比例加重
+  decider 负载。低于下限时 SDK 夹到 30s 并告警，而不是默默接受。
 - **6.7 Domain 路由**：透传官方 `domain`。
 
 ---
@@ -542,8 +652,12 @@ export default definePack({
 
 合并顺序 L0 → L1（按 `extends` 顺序）→ L2，**后者覆盖前者**；数组字段的合并策略显式声明
 （`guardrails` 追加、`toolPolicies` 按键覆盖）。合并后用 JSON Schema 校验，
-并输出**有效配置快照**（effective spec）写入 journal 与 `outputData`，
-使「这次运行到底用的什么配置」可追溯——配置化系统里这一条比什么都重要。
+并输出**有效配置快照**（effective spec），使「这次运行到底用的什么配置」可追溯——
+配置化系统里这一条比什么都重要。
+
+存放位置要分开，否则会撑爆 §6.3 的 `outputData` 预算：
+**全文写 journal**（超阈值按 §6.3 外置到 `BlobStore` 留 ref），
+**`outputData` 里只放 `specHash`**（加可选的 `specRef`）。排查时用 hash 反查全文。
 
 `ca spec diff` 比较两个 spec 的有效配置；`ca spec explain <field>` 说明某字段来自哪一层。
 
@@ -553,6 +667,28 @@ Domain Pack 可贡献：工具、工具策略、护栏、prompt、引擎预设�
 **不可贡献**：受管入口的实现、Journal / Fence 语义、Conductor 映射——这些是 core 的不变量。
 
 > ⚠️ 信任边界：Pack 与引擎适配器都运行在 worker 进程内，具备完整权限，应按依赖审计对待（§9）。
+
+### 7.4 引擎契约版本 —— 让领域包不被上游升级打穿
+
+领域包里的工具用引擎的原生格式写（AI SDK 的 `tool()`），所以上游 SDK 换代时包会破。
+直接让包声明 `ai@^5` 是错的：那把包和一个我们控制不了的版本号绑死了。
+
+**每个引擎自带一个由我们维护的契约版本**，Pack 声明兼容范围，`SpecLoader` 合并时校验：
+
+```ts
+// 引擎适配器声明
+export const engine: AgentEngine = { id: 'ai-sdk/tool-loop', contractVersion: 1, /* ... */ };
+
+// 领域包声明
+definePack({ name: '@acme/ca-pack-insurance', engines: { 'ai-sdk/tool-loop': '^1' }, /* ... */ });
+```
+
+契约版本只在**适配器暴露给 Pack 的形状**变化时才 +1。适配器实际只依赖上游 3 个 API 面
+（`wrapLanguageModel` 中间件、`tool.execute` 包装、`stopWhen`），
+上游升级只要没动这三处，契约版本不变，所有 Pack 无需跟随。
+
+> 类比 USB：设备只认「USB 3.0」这个接口标准，不必关心主板换了什么型号。
+> 详见 [ADR-0017](adr/0017-engine-contract-version.md)。
 
 ---
 
@@ -602,8 +738,11 @@ span: agent.run             (spec.name, engine.id, run_key, workflow_id, tenant)
 ### 10.2 指标
 
 worker 侧指标用官方 SDK 的 Prometheus 采集。本项目补 Agent 语义指标：
-token & cost（按 model / tenant / spec / **engine**）、分片数分布、replay 命中率、
-工具成功率、护栏拦截率、fence 抢占次数、预算触顶次数、能力降级次数。
+token & cost（按 model / tenant / spec / **engine**）、replay 命中率、工具成功率、
+护栏拦截率、fence 抢占次数、预算触顶次数、能力降级次数。
+
+两个专门用于调 `sliceMs` 的观测量（§15.3 第 3 条）：
+**平均分片数 / run** 与 **journal 字节数 / run** —— 分片切得多细、代价多大，得有数才好调。
 
 ### 10.3 流式
 
@@ -625,8 +764,21 @@ AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
 | Spec | 合并语义快照测试；effective spec 的黄金文件 |
 | 集成 | docker-compose 起真实 Conductor OSS（3.21.x，另跑 3.10.6 验证版本探测降级） |
 
-**引擎一致性套件是本轮最重要的新增测试资产**：它把「支持任意 SDK」从口号变成可验证的契约。
+**引擎一致性套件是最重要的测试资产**：它把「支持任意 SDK」从口号变成可验证的契约。
 其中「声明的 capabilities 与实际行为一致」一项尤其关键——它防止适配器谎报能力导致用户误以为有保护。
+基线样本里包含一个**故意谎报能力的假引擎**，用来验证套件确实抓得住。
+
+#### 上游 SDK 版本：用契约测试，不用版本矩阵
+
+适配器实际只依赖 AI SDK 的 **3 个 API 面**：`wrapLanguageModel` 中间件、包装 `tool.execute`、
+`stopWhen` 自定义停止条件——都是上游最底层、最稳定的部分。
+
+因此**不建多版本 CI 矩阵**（组合爆炸、维护成本高、收益低）。做法是：
+
+1. CI 只跑两个版本：`latest` 与 `peerDependencies` 声明的下界。
+2. 引擎一致性套件充当 canary —— 上游一旦动了那 3 个面，它先红。
+3. 适配器 README 里显式列出「我们用到的 API 面」，升级时知道该盯什么。
+4. 依赖机器人盯 `ai` 的 minor 版本，一致性套件绿了才合。
 
 ---
 
@@ -663,7 +815,7 @@ AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
 |---|---|---|
 | **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + `@ca/engine-ai-sdk` + Conductor 桥接 | `minimal-agent` 在 Conductor OSS 3.21.21 上端到端跑通，含跨分片恢复 |
 | **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
-| **M3** 多引擎 | `@ca/engine-harness`（sandbox 型能力降级路径）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；harness 的能力缺失被正确拒绝/降级 |
+| **M3** 多引擎 | `@ca/engine-harness`（sandbox 型能力降级路径）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；harness 的能力缺失被正确拒绝/降级；**逐个适配器实测出 `interceptModel` 结论**（§15.3 第 1 条）并定下长 turn 的处理方式（第 2 条） |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
 | **M5** 生态与交互 | HITL（native-approval 全链路）、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
 | **M6** 生产化 | OTel、Agent 语义指标、预算治理、多租户、CLI 完善、文档站 | 压测报告 + 运维手册 |
@@ -690,21 +842,51 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | [0011](adr/0011-agent-engine-over-strategy.md) | `AgentEngine` 取代自研 `AgentStrategy` | Accepted |
 | [0012](adr/0012-reliability-by-interception.md) | 可靠性通过拦截实现，而非拥有循环 | Accepted |
 | [0013](adr/0013-agent-spec-and-domain-packs.md) | `AgentSpec` 与 L0/L1/L2 领域定制 | Accepted |
+| [0014](adr/0014-native-approval-only-suspension.md) | 挂起只走引擎原生审批，删除 `replay-signal` | Accepted（Amends 0012） |
+| [0015](adr/0015-slice-budget-negotiation.md) | 分片边界：core 给预算、引擎翻译 | Accepted |
+| [0016](adr/0016-resume-decision-from-journal.md) | 用自己的 journal 终态区分崩溃与业务失败 | Accepted |
+| [0017](adr/0017-engine-contract-version.md) | 引擎契约版本与领域包兼容 | Accepted |
 
 ---
 
 ## 15. 遗留问题
 
-1. **`EngineTurn.continue` 的切分时机由谁决定**：core 传 `sliceBudget` 给引擎自行判断，
-   还是 core 通过受管入口的调用计数强制中断（对 AI SDK 可用 `stopWhen` 注入）？倾向后者，M1 验证。
-2. **AI SDK 版本演进节奏很快**（`ToolLoopAgent`、`HarnessAgent`、tool approval 均较新）。
-   适配器应声明支持的版本范围并纳入 CI 矩阵；`@ca/core` 不受影响是这套分层的主要防护。
-3. **sandbox 型 harness 的成本归集**：`interceptModel` 亦可能为 false（模型调用发生在 sandbox 内），
-   届时预算治理只能靠 harness 自身上报，需逐个适配器核实并如实声明。
-4. **`replay-signal` 挂起路径的适用范围**需真实引擎验证；若普遍不可靠，应收窄为「仅支持 native-approval 的引擎才允许 HITL」。
-5. **Domain Pack 的版本兼容**：Pack 依赖引擎原生工具格式，引擎换代时 Pack 会破。
-   是否需要在 Pack 里声明兼容的引擎与版本范围，M4 决定。
-6. ~~TanStack 的定位~~ —— **已定案（2026-09-05）：现阶段不纳入**。
-   其生态（Query / Store / Pacer / Router）以前端为主，Pacer 官方文档亦说明目前主要面向客户端，
-   不适合进 worker 运行时依赖。将来若需要**运行观测台 / 人工审批界面**，
-   独立为 `@ca/console` 应用，通过 §10.3 的 StreamSink 与 StateStore 读取，与 worker 运行时解耦。
+> v0.4 重写文档时遗漏了 v0.3 记录的 4 条 Conductor 侧遗留问题（它们并未解决，只是从文档里消失）。
+> v0.5 已全部补回并处理。
+
+### 15.1 本轮关闭的（6 条）
+
+| 原问题 | 结论 | 出处 |
+|---|---|---|
+| `WorkflowSweeper` 实际扫描周期未知，影响 `sliceMs` / `responseTimeoutSeconds` 取值 | 检测延迟 ≈ `responseTimeoutSeconds + 1s`；且该值同时决定重扫频率，故加 30s 下限 | §2.2、§6.6 |
+| `callbackAfterSeconds` 是否有服务端上限 | **无上限**，只做下限钳制；天花板只有 `timeoutSeconds` | §2.2 |
+| `retryCount` 分不清租约超时重试与业务重试 | 改看自己的 journal 终态，不再从 `retryCount` 反推 | §5.2、ADR-0016 |
+| sandbox 型 harness 的工具拦截能力需逐个核实 | 由 `runtimeLocation` 机械推导，附 9 个适配器能力表 | §4.4 |
+| `replay-signal` 挂起路径是否可靠 | **删除**。9 个适配器中 8 个有原生审批，为 1/9 保留最脆的机制不划算 | §4.7、ADR-0014 |
+| `EngineTurn.continue` 的切分时机由谁决定 | core 给 `sliceBudget`，引擎翻译成原生停止条件；新增 `sliceControl` 能力位 | §5.3、ADR-0015 |
+
+### 15.2 已定方案、随里程碑落地的（2 条）
+
+| 问题 | 方案 | 何时 |
+|---|---|---|
+| 上游 AI SDK 演进快，适配器易碎 | 只依赖 3 个稳定 API 面；CI 只跑 `latest` + peerDep 下界；一致性套件当 canary | M2 |
+| 领域包被引擎升级打穿 | 引擎契约版本（我们自己维护的版本号），Pack 声明兼容范围 | M4，接口在 M1 就位 |
+
+### 15.3 仍然开放的（3 条）
+
+1. **sandbox 型 harness 的 `interceptModel` 尚未确认**。
+   §4.4 的能力表给出了**工具**的运行位置，但没有说明**模型调用**发生在哪。
+   sandbox bridge 型（Claude Code / Codex / Deep Agents / OpenCode）的模型调用很可能也在沙箱内 ——
+   若如此，成本归集与预算治理只能依赖 harness 自身上报，`interceptModel: false` 会直接触发 §4.4 的拒绝启动规则。
+   **需逐个适配器实测后如实声明**；这决定了 `@ca/engine-harness` 到底能不能纳入预算治理。M3 前必须有结论。
+
+2. **`sliceControl: 'none'` 的引擎如何避免撞上 `timeoutSeconds`**。
+   一轮 = 一分片意味着分片时长完全由引擎决定。若某个 harness 的单个 turn 跑了 20 分钟，
+   我们既不能中途停它，也无法提前知道它要多久，只能事后发现总时长超了 `timeoutSeconds`。
+   候选方案：(a) 为这类引擎把 `timeoutSeconds` 按最坏情况放大；
+   (b) 用 `AbortSignal` 硬超时中断并接受状态丢失；(c) 只在 spec 显式声明"允许长 turn"时才准许这类引擎。
+   倾向 (c) + (a)，M3 随 harness 适配一起定。
+
+3. **`callback` 分片的 journal 写放大与存储成本**。
+   每个分片一次持久化，切得越碎写得越多。需在 M2 压测中按 `sliceMs` 量化并给出选型表。
+   先定默认 `sliceMs = 60s`，并在指标里暴露两个直接观测量：**平均分片数/run**、**journal 字节数/run**（§10.2）。

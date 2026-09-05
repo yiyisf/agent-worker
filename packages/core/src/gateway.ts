@@ -28,27 +28,15 @@ export interface ManagedModelGateway {
 }
 
 export interface ManagedToolGateway {
-  /** 可能抛 SuspendSignal / GuardrailBlockedError / BudgetExceededError */
+  /** 可能抛 GuardrailBlockedError / BudgetExceededError */
   guard<T>(toolName: string, input: JsonValue, invoke: () => Promise<T>): Promise<T>;
 }
 
-/**
- * replay-signal 挂起路径（§4.7 B）：受管工具入口抛出本信号，冒泡出引擎循环，
- * core 在边界捕获、持久化 journal、交还 Conductor 分片；恢复时重放到同一工具调用，
- * 这次从 journal / 审批存储直接返回结果而不再抛出。
- *
- * 仅用于 capabilities.suspend === 'replay-signal' 的引擎 —— 能用 native-approval 就不要用它。
+/*
+ * 注：v0.4 曾在此定义 SuspendSignal —— 通过在受管工具入口抛异常炸开引擎调用栈来实现挂起。
+ * v0.5 已删除（ADR-0014）：在别人的代码里抛异常、由别人决定怎么接，本身不可控；
+ * 而实测 9 个 harness 适配器里 8 个都有原生两段式审批。挂起统一走引擎原生审批（§4.7）。
  */
-export class SuspendSignal extends Error {
-  constructor(
-    readonly toolName: string,
-    readonly reason: string,
-    readonly suggestedCallbackAfterSeconds: number,
-  ) {
-    super(`suspended at tool ${toolName}: ${reason}`);
-    this.name = 'SuspendSignal';
-  }
-}
 
 export class BudgetExceededError extends Error {
   constructor(readonly metric: 'tokens' | 'cost' | 'time' | 'toolCalls') {

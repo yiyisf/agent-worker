@@ -4,13 +4,22 @@
  * 公式（v0.3，随默认策略改为 callback 而修订）：
  *
  *   # callback（默认）
- *   responseTimeoutSeconds = ceil(leaseSliceMs/1000 × 3)   // 单片无响应的容忍窗口
- *                                                          // 服务端另加 callbackAfterSeconds，无需为等待留余量
+ *   responseTimeoutSeconds = max(30, ceil(sliceMs/1000 × 3))   // 单片无响应的容忍窗口
+ *                                                              // 服务端另加 callbackAfterSeconds，无需为等待留余量
+ *                                                              // ⚠️ 30s 下限见下方说明
  *   timeoutSeconds         = ceil(wallClockMs/1000 × 1.2)  // 必须覆盖「所有分片执行 + 所有等待」的总和
  *
  *   # lease-extend / hybrid（要求服务端 ≥ 3.10.7）
  *   responseTimeoutSeconds = 60                            // 故意设短 = 崩溃检测灵敏度；且必须 ≥ 1.25
  *   timeoutSeconds         = ceil(wallClockMs/1000 × 1.2)
+ *
+ * ⚠️ responseTimeoutSeconds 的 30s 下限（v0.5 新增，源码核实，见 architecture.md §2.2）：
+ * 该值不只是「多久判定超时」，**它同时决定 Conductor 重新扫描这个工作流的频率** ——
+ * WorkflowSweeper.unack() 在工作流有 IN_PROGRESS 任务时，把 decider 队列的 unack 设为
+ * responseTimeoutSeconds + 1 秒。所以把它调小以求「更快发现崩溃」会成比例加重 decider 负载：
+ * 设成 10s，该工作流就每 11s 被扫一次；1000 个并发工作流即每秒多出约 90 次扫描。
+ * 低于下限时夹到 30s 并告警，而不是默默接受。
+ * 顺带：崩溃检测延迟 ≈ responseTimeoutSeconds + 1s，既非 500ms 也非无界。
  *
  * 两条来自服务端源码核实的硬约束（§2.2）：
  *   1. timeoutSeconds 从 startTime 起算且不加 callbackAfterSeconds —— HITL 等一天就得按一天配

@@ -25,8 +25,13 @@ export interface DomainPack {
   specs?: Record<string, Partial<AgentSpec>>;
   /** eval 数据集路径，供 ca eval 使用 */
   evals?: string;
-  /** 兼容的引擎与版本范围（遗留问题 5，M4 决定是否强制） */
-  engines?: Record<string, string>;
+  /**
+   * **必填**：兼容的引擎与其**契约版本**范围，如 { 'ai-sdk/tool-loop': '^1' }（ADR-0017）。
+   * 声明的是我们自己维护的 AgentEngine.contractVersion，不是上游 SDK 的版本号 ——
+   * 上游升级只要没动适配器依赖的 3 个 API 面，契约版本不变，Pack 无需跟随。
+   * 不声明则 SpecLoader 拒绝加载，不给"忘了写"留余地。
+   */
+  engines: Record<string, string>;
 }
 
 export declare function definePack(pack: DomainPack): DomainPack;

@@ -18,7 +18,8 @@ export interface ToolPolicy {
   onAmbiguousReplay?: 'fail' | 'retry' | 'probe';
   timeoutMs?: number;
   concurrencyKey?: string;
-  /** 需要人工审批 —— 映射到引擎原生审批或 replay-signal（§4.7） */
+  /** 需要人工审批 —— 映射到引擎的原生两段式审批（§4.7）。
+   *  引擎 capabilities.suspend === 'none' 时，声明本字段会导致**启动即拒绝** */
   approval?: 'never' | 'always' | 'policy';
   /** 返回值是否标记为不可信（提示注入防护，§9） */
   trust?: 'trusted' | 'untrusted';
@@ -36,6 +37,14 @@ export interface AgentLimits {
 
 /** 见 ADR-0007 / ADR-0009。默认 callback */
 export type LeaseStrategy = 'callback' | 'lease-extend' | 'hybrid';
+
+/**
+ * 见 ADR-0016。语义已收窄为「**业务失败之后**是否从头重来」。
+ *
+ * 「崩溃/租约丢失」不再由本策略判断 —— 改看自己的 journal 有没有写下终态：
+ *   无终态条目 → worker 半路没了 → 一律续跑（重放已有 journal），与本策略无关
+ *   有终态条目 → 正常跑完并判定失败 → 由本策略决定是否重开
+ */
 export type ResumePolicy = 'on-lease-loss' | 'fresh-per-retry' | 'never';
 
 export interface ConductorTaskOptions {

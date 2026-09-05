@@ -7,7 +7,8 @@
  *   3. @ca/testing 引擎一致性套件的基线样本 —— 包括一个**故意谎报 capabilities 的假引擎**，
  *      用于验证一致性套件确实能抓到它
  *
- * capabilities: state 'replay' / suspend 'replay-signal' / intercept* true / granularity 'step'
+ * capabilities: runtimeLocation 'host-process' / state 'snapshot' / suspend 'none' /
+ *               sliceControl 'native' / intercept* true / granularity 'step'
  *
  * M0 骨架：待实现
  */

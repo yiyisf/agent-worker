@@ -1,6 +1,6 @@
 # ADR-0012：可靠性通过拦截两个入口实现，而非拥有循环
 
-- 状态：Accepted
+- 状态：Accepted（`suspend` 一项被 [ADR-0014](0014-native-approval-only-suspension.md) 修订）
 - 日期：2026-09-05
 
 ## 背景
@@ -42,7 +42,7 @@ interface ManagedToolGateway {
 ```ts
 interface EngineCapabilities {
   state: 'messages' | 'snapshot' | 'engine-session' | 'replay';
-  suspend: 'native-approval' | 'replay-signal' | 'none';
+  suspend: 'native-approval' | 'none';   // ADR-0014 删除了 replay-signal
   interceptModel: boolean;
   interceptTools: boolean;
   granularity: 'step' | 'turn';
@@ -69,3 +69,14 @@ interface EngineCapabilities {
   → 由引擎一致性套件暴露；`ToolLoopAgent` 这类纯粹的循环天然成立。
 - **重放会重跑循环的非受管部分**（拼消息、跑停止条件），有 CPU 开销但无外部代价。
   → 相对被短路掉的 LLM 调用可忽略。
+
+---
+
+## 修订（2026-09-05，ADR-0014）
+
+本 ADR 原先允许 `suspend: 'replay-signal'` —— 在受管工具入口抛异常炸开引擎调用栈来强行挂起。
+该路径已删除：机制本身不可控（异常怎么被接由别人决定），而实测 9 个 harness 适配器中
+8 个都有原生审批，为 1/9 的场景保留最脆的机制不划算。详见
+[ADR-0014](0014-native-approval-only-suspension.md)。
+
+本 ADR 的其余内容（两个受管入口、拦截式可靠性、`EngineCapabilities` 显式建模）不变。
