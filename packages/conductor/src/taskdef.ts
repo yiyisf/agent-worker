@@ -1,25 +1,35 @@
 /**
  * 由 AgentDefinition.limits 推导 Conductor TaskDef，见 docs/architecture.md §6.6。占位。
  *
- * v0.2 关键修正（ADR-0007）：有了 extendLease 心跳之后，responseTimeoutSeconds 应该设**短**：
+ * 公式（v0.3，随默认策略改为 callback 而修订）：
  *
- *   responseTimeoutSeconds  短（如 60s） = 崩溃检测灵敏度（进程死了心跳就停，60s 内重投）
- *   timeoutSeconds          长（覆盖 wallClockMs） = 总执行上限（心跳不延长它）
+ *   # callback（默认）
+ *   responseTimeoutSeconds = ceil(leaseSliceMs/1000 × 3)   // 单片无响应的容忍窗口
+ *                                                          // 服务端另加 callbackAfterSeconds，无需为等待留余量
+ *   timeoutSeconds         = ceil(wallClockMs/1000 × 1.2)  // 必须覆盖「所有分片执行 + 所有等待」的总和
  *
- * v0.1 把 responseTimeoutSeconds 设为 wallClock×1.5，会让崩溃后卡满整个租约，已废弃。
+ *   # lease-extend / hybrid（要求服务端 ≥ 3.10.7）
+ *   responseTimeoutSeconds = 60                            // 故意设短 = 崩溃检测灵敏度；且必须 ≥ 1.25
+ *   timeoutSeconds         = ceil(wallClockMs/1000 × 1.2)
+ *
+ * 两条来自服务端源码核实的硬约束（§2.2）：
+ *   1. timeoutSeconds 从 startTime 起算且不加 callbackAfterSeconds —— HITL 等一天就得按一天配
+ *   2. retryCount 不可为 0 —— responseTimeout 超时会判 TIMED_OUT 并消耗一次重试配额
+ *   另注：timeoutPolicy 对 responseTimeout 无效（该路径直接 timeoutTask()），仅作用于 timeoutSeconds
  */
 import type { AgentDefinition } from '@ca/core';
 
 /** 结构对齐官方 SDK 的 TaskDef，注册时交给官方 MetadataClient */
 export interface DerivedTaskDef {
   name: string;
+  /** 不可为 0，见上 */
   retryCount: number;
   retryLogic: 'FIXED' | 'EXPONENTIAL_BACKOFF';
   retryDelaySeconds: number;
-  /** 总执行上限，由 limits.wallClockMs 推导 */
+  /** 总执行上限，含所有 callback 等待 */
   timeoutSeconds: number;
-  /** 崩溃检测灵敏度；lease-extend/hybrid 下设短，且必须 ≥ 1.25 */
   responseTimeoutSeconds: number;
+  /** 仅作用于 timeoutSeconds，对 responseTimeout 无效 */
   timeoutPolicy: 'RETRY' | 'TIME_OUT_WF' | 'ALERT_ONLY';
   concurrentExecLimit?: number;
   rateLimitPerFrequency?: number;

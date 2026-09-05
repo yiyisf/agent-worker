@@ -4,6 +4,7 @@
  *
  * 占位：仅声明契约，实现随 M1 落地。
  */
+import type { AgentProfile, AgentStrategy, BuiltinStrategyId } from './strategy.js';
 import type { Guardrail } from './guardrail.js';
 import type { ModelRef } from './model.js';
 import type { RunContext } from './context.js';
@@ -32,12 +33,14 @@ export interface AgentLimits {
 export type ResumePolicy = 'on-lease-loss' | 'fresh-per-retry' | 'never';
 
 /**
- * 租约策略，见 ADR-0007。
- * - lease-extend 默认。整个循环在一次 execute() 内跑完，由官方 SDK 的 extendLease 心跳续租
- * - callback     IN_PROGRESS + callbackAfterSeconds 交还任务、释放槽位，适合等待外部信号
- * - hybrid       计算期 lease-extend，进入等待态切 callback（长时 Agent 推荐）
+ * 租约策略，见 ADR-0007 与 ADR-0009。
+ * - callback     **默认**。分片执行：IN_PROGRESS + callbackAfterSeconds 交还任务、释放槽位。
+ *                Conductor 3.x 全系可用；恢复路径变成每次运行的主路径，因而被高频验证
+ * - lease-extend 整个循环在一次 execute() 内跑完，由官方 SDK 的 extendLease 心跳续租。
+ *                **要求 Conductor ≥ v3.10.7**
+ * - hybrid       计算期 lease-extend、等待期 callback。同样要求 ≥ v3.10.7
  */
-export type LeaseStrategy = 'lease-extend' | 'callback' | 'hybrid';
+export type LeaseStrategy = 'callback' | 'lease-extend' | 'hybrid';
 
 export interface ConductorTaskOptions {
   /** 默认 `agent_<name>` */
@@ -55,6 +58,12 @@ export interface ConductorTaskOptions {
 export interface AgentDefinition<I = unknown, O = unknown> {
   name: string;
   version?: number;
+
+  /** 推理策略。字符串取内置策略，或直接传自定义实现。默认 'react'（ADR-0010） */
+  strategy?: BuiltinStrategyId | AgentStrategy;
+  /** 场景 Profile：预置 strategy/limits/guardrails/conductor 的组合，字段级覆盖 */
+  profile?: AgentProfile;
+
   instructions: string | ((input: I, ctx: RunContext) => string | Promise<string>);
   /** 单个模型或主备链 */
   model: ModelRef | ModelRef[];

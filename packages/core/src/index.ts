@@ -14,3 +14,5 @@ export type * from './journal.js';
 export type * from './guardrail.js';
 export type * from './events.js';
 export type * from './step-executor.js';
+export type * from './strategy.js';
+export type * from './plugin.js';
