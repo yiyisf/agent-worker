@@ -45,9 +45,16 @@ importers:
       '@ca/core':
         specifier: workspace:*
         version: link:../core
+    devDependencies:
+      '@ca/testing':
+        specifier: workspace:*
+        version: link:../testing
       ai:
-        specifier: ^7.0.0
+        specifier: ^7
         version: 7.0.93(zod@4.5.4)
+      zod:
+        specifier: ^4
+        version: 4.5.4
 
   packages/engine-custom:
     dependencies:
@@ -68,7 +75,11 @@ importers:
 
   packages/observability: {}
 
-  packages/testing: {}
+  packages/testing:
+    dependencies:
+      '@ca/core':
+        specifier: workspace:*
+        version: link:../core
 
 packages:
 

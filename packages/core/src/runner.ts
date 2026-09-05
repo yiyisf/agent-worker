@@ -27,9 +27,13 @@ export type SliceOutcome =
     }
   | { kind: 'failed'; error: SerializedError; budget: BudgetSnapshot; sliceIndex: number };
 
-export interface RunSliceOptions {
+/**
+  * TState 是**引擎自己的**状态形状，对 core 不透明（§4.5）。
+  * core 只要求它可 JSON 序列化，落 journal 时按 JsonValue 存。
+  */
+export interface RunSliceOptions<TState = JsonValue> {
   spec: AgentSpec;
-  agent: BuiltAgent;
+  agent: BuiltAgent<TState>;
   input: JsonValue;
   ctx: RunContext;
   store: StateStore;
@@ -98,7 +102,7 @@ function deriveSliceBudget(spec: AgentSpec, override?: Partial<SliceBudget>): Sl
  *
  * 重入是安全的：journal 里已有终态时直接返回该终态，不会重跑。
  */
-export async function runSlice(opts: RunSliceOptions): Promise<SliceOutcome> {
+export async function runSlice<TState = JsonValue>(opts: RunSliceOptions<TState>): Promise<SliceOutcome> {
   const { spec, agent, ctx, store, lease } = opts;
   const history = await store.readJournal(ctx.runKey);
 
@@ -144,7 +148,7 @@ export async function runSlice(opts: RunSliceOptions): Promise<SliceOutcome> {
   try {
     const turn = await agent.run({
       input: opts.input,
-      ...(restored.state !== undefined ? { state: restored.state } : {}),
+      ...(restored.state !== undefined ? { state: restored.state as TState } : {}),
       ...(opts.resumeWith !== undefined ? { resumeWith: opts.resumeWith } : {}),
       budget: deriveSliceBudget(spec, opts.sliceBudget),
       ctx,
@@ -160,7 +164,7 @@ export async function runSlice(opts: RunSliceOptions): Promise<SliceOutcome> {
     }
 
     if (turn.kind === 'continue') {
-      journal.append({ kind: 'slice', index: sliceIndex, state: turn.state, budget: snap });
+      journal.append({ kind: 'slice', index: sliceIndex, state: turn.state as JsonValue, budget: snap });
       await journal.flush();
       report('continue');
       return { kind: 'continue', budget: snap, sliceIndex };
@@ -176,7 +180,7 @@ export async function runSlice(opts: RunSliceOptions): Promise<SliceOutcome> {
       kind: 'suspend',
       awaiting: turn.awaiting as unknown as JsonValue,
       resumeToken,
-      state: turn.state,
+      state: turn.state as JsonValue,
       budget: snap,
     });
     await journal.flush();
