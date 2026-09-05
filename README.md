@@ -120,10 +120,18 @@ examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
 M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把契约打磨对，再谈通用——
 反过来做必然设计出架空的抽象。
 
-## 待确认
+## 已定案：TanStack 现阶段不纳入
 
-**TanStack 的定位。** 其生态（Query / Store / Router / Pacer）以前端为主，
+其生态（Query / Store / Router / Pacer）以前端为主，
 [Pacer 官方文档](https://tanstack.com/pacer/latest/docs/overview)亦说明目前主要面向客户端，
-放进 worker 运行时依赖并不合适。若目标是**运行观测台 / 人工审批界面**，
-建议独立为 `@ca/console` 应用，通过 StreamSink 与 StateStore 读取，不进 worker 运行时——
-请确认这个理解是否与预期一致（见 [architecture.md §15](docs/architecture.md#15-遗留问题) 遗留问题 6）。
+不适合进 worker 运行时依赖。将来若需要**运行观测台 / 人工审批界面**，
+独立为 `@ca/console` 应用，通过 StreamSink 与 StateStore 读取，与 worker 运行时解耦。
+
+## 文档校验
+
+架构图是 mermaid，肉眼评审抓不住语法问题（`subgraph` 标题含全角括号必须加引号）。
+校验命令：
+
+```bash
+npm run docs:check-mermaid    # 渲染 docs/ 下所有 mermaid 块，失败即报错
+```

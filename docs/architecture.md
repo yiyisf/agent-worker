@@ -109,46 +109,68 @@ v0.3 的 core 自建了推理循环（`AgentStrategy`），因为「要写 journ
 
 ```mermaid
 graph TB
-  subgraph 用户侧
-    SPEC["AgentSpec (JSON/TS/YAML)<br/>L0 默认 → L1 领域包 → L2 实例"]
-    PACK["Domain Pack<br/>tools / guardrails / prompts / evals"]
+  subgraph U["用户侧"]
+    SPEC["AgentSpec<br/>JSON / TS / YAML"]
+    PACK["Domain Pack<br/>工具 / 策略 / 护栏 / prompt / eval"]
   end
 
-  subgraph "@ca/core — 薄契约层 + 可靠性内核"
+  subgraph C1["@ca/core · 契约与装配"]
+    SL["SpecLoader<br/>L0→L1→L2 合并 + schema 校验"]
     EC["AgentEngine 契约<br/>+ EngineCapabilities 校验"]
-    MG["ManagedModelGateway<br/>journal 短路 / 预算 / 计费 / span"]
-    TG["ManagedToolGateway<br/>journal 短路 / 幂等 / 护栏 / suspend"]
-    JN["Journal + Fence + BudgetGovernor"]
-    SL["SpecLoader 合并 + schema 校验"]
   end
 
-  subgraph 引擎适配（可替换）
+  subgraph ENG["引擎适配层 · 可替换"]
     E1["@ca/engine-ai-sdk<br/>ToolLoopAgent"]
-    E2["@ca/engine-harness<br/>HarnessAgent: Claude Code/Codex/Cursor/OpenCode/Pi…"]
+    E2["@ca/engine-harness<br/>Claude Code / Codex / Cursor / OpenCode / Pi"]
     E3["@ca/engine-custom<br/>手写循环参考实现"]
   end
 
-  subgraph 外部生态（不重复实现）
-    AISDK["Vercel AI SDK<br/>循环 / provider / @ai-sdk/mcp / 结构化输出"]
+  EXT["外部生态 · 不重复实现<br/>Vercel AI SDK<br/>循环 / provider / MCP / 结构化输出"]
+
+  subgraph C2["@ca/core · 可靠性内核"]
+    subgraph GW["受管入口 · 可靠性的唯一作用点"]
+      MG["ManagedModelGateway<br/>决定成本"]
+      TG["ManagedToolGateway<br/>决定副作用"]
+    end
+    JN["Journal + Fence + BudgetGovernor"]
   end
 
-  subgraph "@ca/conductor — 薄桥接层（v0.3 已对齐）"
+  subgraph BR["@ca/conductor · 薄桥接层"]
     CP["Worker 编译"]
     LS["callback 分片 / Fencing"]
     RM["ResultMapper"]
   end
 
-  OFF["@io-orkes/conductor-javascript"]
+  OFF["@io-orkes/conductor-javascript<br/>官方 SDK · poll / 并发 / 心跳 / 指标"]
+  CD[("Conductor Server")]
 
-  SPEC & PACK --> SL --> EC
-  EC --> E1 & E2 & E3
-  E1 & E2 & E3 --> AISDK
-  E1 & E2 & E3 -.模型/工具调用必经.-> MG & TG
-  MG & TG --> JN
+  SPEC --> SL
+  PACK --> SL
+  SL --> EC
+  EC --> E1
+  EC --> E2
+  EC --> E3
+
+  E1 --- EXT
+  E2 --- EXT
+
+  E1 -. "所有模型 / 工具调用必经" .-> GW
+  E2 -.-> GW
+  E3 -.-> GW
+
+  MG --> JN
+  TG --> JN
+
   CP --> EC
-  CP --> LS --> JN
-  CP --> OFF --> CD[(Conductor Server)]
+  CP --> LS
+  CP --> RM
+  LS --> JN
+  RM --> OFF
+  CP --> OFF
+  OFF --> CD
 ```
+
+> 图例：实线为装配与数据流；**虚线为引擎对受管入口的调用** —— 引擎适配器的唯一硬性义务。
 
 四条结构性约束：
 
@@ -682,7 +704,7 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 4. **`replay-signal` 挂起路径的适用范围**需真实引擎验证；若普遍不可靠，应收窄为「仅支持 native-approval 的引擎才允许 HITL」。
 5. **Domain Pack 的版本兼容**：Pack 依赖引擎原生工具格式，引擎换代时 Pack 会破。
    是否需要在 Pack 里声明兼容的引擎与版本范围，M4 决定。
-6. **TanStack 的定位待确认**（见 README 说明）：其生态（Query / Store / Pacer / Router）以前端为主，
-   Pacer 官方文档亦说明目前主要面向客户端。若目标是**运行观测台 / 人工审批界面**，
-   建议独立为 `@ca/console` 应用，通过 §10.3 的 StreamSink 与 StateStore 读取，
-   不进 worker 运行时依赖——请确认这个理解是否与预期一致。
+6. ~~TanStack 的定位~~ —— **已定案（2026-09-05）：现阶段不纳入**。
+   其生态（Query / Store / Pacer / Router）以前端为主，Pacer 官方文档亦说明目前主要面向客户端，
+   不适合进 worker 运行时依赖。将来若需要**运行观测台 / 人工审批界面**，
+   独立为 `@ca/console` 应用，通过 §10.3 的 StreamSink 与 StateStore 读取，与 worker 运行时解耦。
