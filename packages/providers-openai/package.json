@@ -1,0 +1,13 @@
+{
+  "name": "@ca/providers-openai",
+  "version": "0.0.0",
+  "description": "OpenAI 兼容模型适配器",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts"
+  }
+}

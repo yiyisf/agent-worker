@@ -1,0 +1,13 @@
+{
+  "name": "@ca/testing",
+  "version": "0.0.0",
+  "description": "Conductor 假服务、脚本化模型、崩溃注入与 Journal 断言",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts"
+  }
+}

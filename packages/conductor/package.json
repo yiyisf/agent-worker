@@ -1,0 +1,13 @@
+{
+  "name": "@ca/conductor",
+  "version": "0.0.0",
+  "description": "Conductor 适配层：REST 客户端、poll 循环、租约、结果映射、TaskDef 生成",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts"
+  }
+}

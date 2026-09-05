@@ -1,0 +1,13 @@
+{
+  "name": "@ca/core",
+  "version": "0.0.0",
+  "description": "Conductor 无关的 Agent 运行时：定义、状态机、Journal、工具、护栏、预算、事件",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts"
+  }
+}

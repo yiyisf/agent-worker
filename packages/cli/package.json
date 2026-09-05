@@ -1,0 +1,13 @@
+{
+  "name": "@ca/cli",
+  "version": "0.0.0",
+  "description": "脚手架、TaskDef 注册、本地运行与 Journal 查看",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": ["dist"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsup src/index.ts --format esm,cjs --dts"
+  }
+}
