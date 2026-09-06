@@ -1,0 +1,60 @@
+# Conductor OSS + Redis，供 minimal-agent 端到端验证使用。
+#
+# ⚠️ 关于镜像版本：Docker Hub 的 conductoross/conductor 上**没有 3.21.21 这个 tag**
+#    （3.21.x 只发布了 3.21.24-rc.1；最近的已发布稳定版是 3.22.x）。
+#    本文件默认用 3.22.3 —— 它是 ≥ 3.21.21 的最近稳定版。
+#    若你要对着自己的 3.21.21 构建验证，设 CONDUCTOR_IMAGE_TAG 指过去即可：
+#        CONDUCTOR_IMAGE_TAG=3.21.21 docker compose up -d
+#
+#    我们依赖的服务端语义（callbackAfterSeconds、responseTimeout 判定、
+#    taskExecLogSizeLimit）都是照着 **3.21.21 的源码**核实的，见 architecture.md §2.2。
+#
+# 选 postgres 变体而非默认的 redis+elasticsearch 变体，两个原因：
+#   1. 少一个 Elasticsearch，启动快、吃内存少
+#   2. 它的 config-postgres.properties 是 conductor.indexing.type=postgres，
+#      **task log 照样能存**（§10.4 的通道二可验证）。
+#      若换成关掉索引的部署，我们的启动自检会关掉该通道并告警一次 —— 那也是预期行为。
+
+services:
+  conductor:
+    image: conductoross/conductor:${CONDUCTOR_IMAGE_TAG:-3.22.3}
+    container_name: ca-conductor
+    environment:
+      - CONFIG_PROP=config-postgres.properties
+    ports:
+      - '8080:8080' # REST API + UI
+    depends_on:
+      conductor-postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:8080/health']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+
+  conductor-postgres:
+    image: postgres:16-alpine
+    container_name: ca-conductor-postgres
+    environment:
+      - POSTGRES_USER=conductor
+      - POSTGRES_PASSWORD=conductor
+      - POSTGRES_DB=conductor
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U conductor']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # 我们自己的 StateStore：journal、租约与 fencing 都在这里（§8）
+  redis:
+    image: redis:7-alpine
+    container_name: ca-redis
+    command: ['redis-server', '--save', '', '--appendonly', 'no']
+    ports:
+      - '6380:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 20

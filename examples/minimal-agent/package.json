@@ -2,5 +2,24 @@
   "name": "@ca-example/minimal-agent",
   "version": "0.0.0",
   "private": true,
-  "type": "module"
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "up": "docker compose -f docker-compose.yml up -d",
+    "down": "docker compose -f docker-compose.yml down -v"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^4.0.49",
+    "@ca/conductor": "workspace:*",
+    "@ca/core": "workspace:*",
+    "@ca/engine-ai-sdk": "workspace:*",
+    "@ca/memory": "workspace:*",
+    "@io-orkes/conductor-javascript": "^4.0.0",
+    "ai": "^7.0.0",
+    "ioredis": "^5.4.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
 }

@@ -1,7 +1,8 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
 > 状态：Draft v0.6 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
-> 上游 Agent SDK 基线：**`ai@7.0.93`**（v0.4–v0.5 的所有 AI SDK 结论均基于 v7 主干核实）
+> 上游基线（M1 实装核实）：**`ai@7.0.93`**、**`@io-orkes/conductor-javascript@4.0.0`**
+> —— 官方 Conductor SDK 的实际发布版是 4.0.0（不是早前文中写的 3.x），`TaskManager` / `TaskRunner` / `TaskHandler` / `LeaseTracker` / `getTaskContext` / `NonRetryableException` 在 4.0.0 均在，ADR-0006 的复用清单不受影响。
 >
 > **v0.6 变更**
 > 1. **纠错**：`@ca/engine-ai-sdk` 的 peerDependency 原写 `ai >= 5.0.0`，而 `ToolLoopAgent` /
@@ -13,6 +14,10 @@
 >    （[ADR-0018](adr/0018-progress-reporting.md)）。注意是**进展**，不是执行过程的实时输出流。
 >
 > v0.4–v0.5 的其余结论不变。
+>
+> **实装状态（M1 完成，待真机验证）**：`@ca/core` / `@ca/engine-ai-sdk` / `@ca/memory` /
+> `@ca/conductor` / `@ca/testing` 已实现，**91 个测试**（88 通过 + 3 个端到端待真机）。
+> 端到端验证清单见 [verification.md](verification.md) —— 需要在有 docker daemon 的机器上执行。
 
 ---
 
@@ -81,6 +86,9 @@
 - `timeoutSeconds` 从 `startTime` 起算且**不加** callbackTime → 真正约束是
   **Σ(所有分片执行 + 所有等待) < `timeoutSeconds`**。
 - `extendLease` 真心跳自 **v3.10.7** 起可用（v3.10.6 无）；`callbackAfterSeconds` 3.x 全系可用。
+- ⚠️ **`3.21.21` 在 Docker Hub 上没有发布镜像**（`conductoross/conductor` 的 3.21.x 只有
+  `3.21.24-rc.1`，最近的已发布稳定版是 `3.22.x`）。本节所有结论均据 **3.21.21 源码**核实；
+  示例的 compose 默认用 `3.22.3`，可用 `CONDUCTOR_IMAGE_TAG` 指向自建的 3.21.21。
 - **`callbackAfterSeconds` 没有服务端上限**：`ExecutionService.requeue()` 只做下限钳制
   （`< 0 → 0`）并扣除已过去的时间，不校验上限。真正的天花板只有 `timeoutSeconds`。
 
@@ -929,7 +937,7 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + `@ca/engine-ai-sdk` + Conductor 桥接 + **进展反馈两通道（§10.4）** | `minimal-agent` 在 Conductor OSS 3.21.21 上端到端跑通，含跨分片恢复；运行中在 Conductor UI 能看到进度 |
+| **M1** 最小可用 ✅ 代码完成 | M1.1 core 可靠性内核 · M1.2 engine-ai-sdk 适配 · M1.3 redis StateStore + Conductor 桥接 · M1.4 进展反馈两通道 · M1.5 minimal-agent 示例 | 88 个离线测试通过；3 个端到端用例待真机执行（[verification.md](verification.md)） |
 | **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
 | **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效；定下长 turn 的处理方式（§15.3 第 1 条） |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |

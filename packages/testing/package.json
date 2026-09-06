@@ -11,5 +11,8 @@
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts"
+  },
+  "dependencies": {
+    "@ca/core": "workspace:*"
   }
 }

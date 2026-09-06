@@ -41,3 +41,39 @@ Worker 编译（`AgentDefinition` → `ConductorWorker`）、journal/fencing 接
   升级只改一个包；官方 SDK 声明为 peerDependency，版本范围由用户控制。
 - **失去对 poll 的深度控制**：官方 `concurrency` 是静态值。
   → 通过动态调节 concurrency 实现令牌预算反压（architecture.md §6.5），够用。
+
+---
+
+## 实装核实（2026-09-05，M1.3）
+
+按 `@io-orkes/conductor-javascript@4.0.0` 逐个确认本 ADR 的复用清单，全部存在：
+
+| 复用项 | 4.0.0 中的形态 |
+|---|---|
+| 客户端 | `orkesConductorClient`（= `createConductorClient`）、`OrkesClients` |
+| poll 循环与并发 | `TaskManager(client, workers, config)`、`TaskRunner`、`TaskHandler` |
+| 心跳续租 | `LeaseTracker`，以及 `ConductorWorker.leaseExtendEnabled` |
+| 任务级上下文 | `getTaskContext()` → `TaskContext`（`addLog` / `setCallbackAfter`） |
+| 终局错误 | `NonRetryableException` |
+| 元数据与工作流 | `MetadataClient`、`WorkflowClient` |
+
+`ConductorWorker` 的实际签名：
+
+```ts
+interface ConductorWorker {
+  taskDefName: string;
+  execute: (task: Task) => Promise<Omit<TaskResult, 'workflowInstanceId' | 'taskId'> | TaskInProgressResult>;
+  domain?: string;
+  concurrency?: number;
+  pollInterval?: number;
+  leaseExtendEnabled?: boolean;
+}
+interface TaskInProgressResult { status: 'IN_PROGRESS'; callbackAfterSeconds: number; outputData?: Record<string, unknown>; }
+```
+
+`TaskInProgressResult` 正是 callback 分片交还的形状，与 §5.3 的设计直接对上。
+peerDependency 相应收紧为 `>=4.0.0`。
+
+**已知摩擦**：该 SDK 声明 `zod ^3.22.0` 的 peer，与 `ai@7` 所需的 zod 4 冲突。
+我们只用它的传输层、不用需要 zod 的 `/agents` 子路径，因此在根 `package.json` 用
+`pnpm.peerDependencyRules.allowedVersions` 显式放行并记录理由，而不是降级 zod。

@@ -1,10 +1,12 @@
 /**
- * 租约策略与 Fencing，见 docs/architecture.md §5.3、ADR-0007、ADR-0009。占位：仅声明契约。
+ * 租约策略与交还预算，见 docs/architecture.md §5.3、ADR-0007、ADR-0009。
  *
- * 默认策略是 `callback`（分片执行）。心跳续租不由本项目实现 —— 官方 SDK 的 LeaseTracker
- * 已提供 extendLease 真心跳；本模块只负责：选择策略、决定何时交还任务、版本探测、Fencing。
+ * 默认策略是 callback（分片执行）。心跳续租不由本项目实现 —— 官方 SDK 的 LeaseTracker
+ * 已提供 extendLease 真心跳；本模块只负责：版本探测、决定交还多久、以及 fencing 的错误类型。
  */
-import type { LeaseRecord } from '@ca/core';
+import { FencedOutError } from '@ca/core';
+
+export { FencedOutError };
 
 /**
  * extendLease 的服务端可用范围（按 conductor-oss/conductor git tag 抽样源码得出）：
@@ -23,11 +25,32 @@ export const OFFICIAL_LEASE_EXTEND = {
   minResponseTimeoutSeconds: 1.25,
 } as const;
 
+function parseVersion(v: string): [number, number, number] {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)/.exec(v.trim());
+  if (!m) return [0, 0, 0];
+  return [Number(m[1]), Number(m[2]), Number(m[3])];
+}
+
+export function supportsExtendLease(serverVersion: string): boolean {
+  const [a, b, c] = parseVersion(serverVersion);
+  const [x, y, z] = parseVersion(EXTEND_LEASE_MIN_SERVER_VERSION);
+  if (a !== x) return a > x;
+  if (b !== y) return b > y;
+  return c >= z;
+}
+
 /**
- * 启动时探测服务端版本；选了 lease-extend / hybrid 而版本不足时拒绝启动，
- * 并提示改用 callback（§6.1）。
+ * 选了 lease-extend / hybrid 而服务端版本不足时拒绝启动，并提示改用 callback（§6.1）。
+ * 拒绝发生在启动时，不留到运行期。
  */
-export declare function assertExtendLeaseSupported(serverVersion: string): void;
+export function assertExtendLeaseSupported(serverVersion: string): void {
+  if (!supportsExtendLease(serverVersion)) {
+    throw new Error(
+      `leaseStrategy 需要服务端 extendLease 支持（≥ ${EXTEND_LEASE_MIN_SERVER_VERSION}），` +
+        `当前服务端为 ${serverVersion}。请改用 leaseStrategy='callback'（Conductor 3.x 全系可用）。`,
+    );
+  }
+}
 
 /** 一次 execute() 结束时，桥接层要告诉 Conductor 的事 */
 export type LeaseOutcome =
@@ -35,32 +58,34 @@ export type LeaseOutcome =
   /** 本片做完但整体未完成，或在等待外部信号：交还任务并释放槽位 */
   | { kind: 'handback'; callbackAfterSeconds: number; reason: string };
 
-export interface LeaseGuard {
-  /** 抢占 runKey 的执行权；失败表示已有更新的 owner，本 worker 应立即放弃 */
-  acquire(runKey: string): Promise<LeaseRecord | undefined>;
-  /** 每次写 journal / 回写 Conductor 前校验 fenceToken 是否仍然有效 */
-  assertValid(lease: LeaseRecord): Promise<void>;
-  release(lease: LeaseRecord): Promise<void>;
-}
-
-export class FencedOutError extends Error {
-  constructor(readonly runKey: string, readonly ownFence: number, readonly currentFence: number) {
-    super(`run ${runKey} fenced out: own=${ownFence} current=${currentFence}`);
-    this.name = 'FencedOutError';
-  }
-}
-
 /**
- * 预算校验（源码核实，见 architecture.md §2.2）：
+ * 交还预算校验（源码核实，见 architecture.md §2.2）：
  *
  * - responseTimeout 判定用 adjustedResponseTimeout = responseTimeoutSeconds + callbackAfterSeconds，
  *   所以 callbackAfterSeconds **不需要**小于 responseTimeoutSeconds。
  * - timeoutSeconds 从 startTime 起算且**不加** callbackAfterSeconds，因此真正的约束是
- *   Σ(所有分片执行 + 所有等待) < timeoutSeconds。本函数据此判断本次交还是否会撞上总超时。
+ *   Σ(所有分片执行 + 所有等待) < timeoutSeconds。本函数据此判断本次交还会不会撞上总超时。
  */
-export declare function checkHandbackBudget(args: {
+export function checkHandbackBudget(args: {
   requestedCallbackAfterSeconds: number;
   taskStartTimeMs: number;
   timeoutSeconds: number;
   now: number;
-}): { seconds: number; clamped: boolean; willExceedTotalTimeout: boolean };
+}): { seconds: number; clamped: boolean; willExceedTotalTimeout: boolean } {
+  const requested = Math.max(0, Math.floor(args.requestedCallbackAfterSeconds));
+  if (args.timeoutSeconds <= 0 || args.taskStartTimeMs <= 0) {
+    return { seconds: requested, clamped: false, willExceedTotalTimeout: false };
+  }
+  const elapsedSeconds = Math.max(0, (args.now - args.taskStartTimeMs) / 1000);
+  const remaining = args.timeoutSeconds - elapsedSeconds;
+
+  if (remaining <= 0) {
+    return { seconds: 0, clamped: true, willExceedTotalTimeout: true };
+  }
+  if (requested >= remaining) {
+    // 留一点余量给下一片的执行，否则一醒来就撞上总超时
+    const seconds = Math.max(1, Math.floor(remaining * 0.8));
+    return { seconds, clamped: true, willExceedTotalTimeout: true };
+  }
+  return { seconds: requested, clamped: false, willExceedTotalTimeout: false };
+}
