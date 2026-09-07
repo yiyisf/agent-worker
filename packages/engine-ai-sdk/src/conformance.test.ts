@@ -1,3 +1,4 @@
+/** 适配器必须通过一致性套件 —— 声明的 capabilities 与实际行为一致 */
 import { describe, expect, it } from 'vitest';
 import { tool } from 'ai';
 import { MockLanguageModelV4 } from 'ai/test';
@@ -6,64 +7,61 @@ import { checkEngineConformance } from '@ca/testing';
 import type { AgentSpec, JsonValue } from '@ca/core';
 import { createAiSdkEngine } from './index.js';
 
-const usage = (i: number, o: number) => ({
-  inputTokens: { total: i, noCache: i, cacheRead: 0, cacheWrite: 0 },
-  outputTokens: { total: o, text: o, reasoning: 0 },
-});
-
-describe('engine-ai-sdk 通过引擎一致性套件', () => {
-  it('声明的 capabilities 与实际行为一致，零违规', async () => {
+describe('ai-sdk/tool-loop 一致性', () => {
+  it('零违规', async () => {
     const violations = await checkEngineConformance({
       async create() {
-        let realModel = 0;
-        let realTool = 0;
-        let i = 0;
-        const responses = [
-          {
-            content: [
-              { type: 'tool-call', toolCallId: 'c1', toolName: 'lookup', input: JSON.stringify({ id: 1 }) },
-            ],
-            finishReason: { unified: 'tool-calls' },
-            usage: usage(10, 5),
-            warnings: [],
-          },
-          {
-            content: [{ type: 'text', text: '完成' }],
-            finishReason: { unified: 'stop' },
-            usage: usage(20, 8),
-            warnings: [],
-          },
-        ];
+        let modelCalls = 0;
+        let toolCalls = 0;
         const model = new MockLanguageModelV4({
           doGenerate: async () => {
-            realModel++;
-            return responses[i++] as never;
+            modelCalls += 1;
+            const usage = {
+              inputTokens: { total: 50, noCache: 50, cacheRead: 0, cacheWrite: 0 },
+              outputTokens: { total: 10, text: 10, reasoning: 0 },
+            };
+            if (modelCalls === 1) {
+              return {
+                content: [
+                  { type: 'tool-call' as const, toolCallId: 'c1', toolName: 'echo', input: '{"v":1}' },
+                ],
+                finishReason: { unified: 'tool-calls' as const },
+                usage,
+                warnings: [],
+              } as never;
+            }
+            return {
+              content: [{ type: 'text' as const, text: 'ok' }],
+              finishReason: { unified: 'stop' as const },
+              usage,
+              warnings: [],
+            } as never;
           },
         });
         const engine = createAiSdkEngine({
-          model,
+          model: model as never,
           tools: {
-            lookup: tool({
-              description: 'x',
-              inputSchema: z.object({ id: z.number() }),
-              execute: async ({ id }) => {
-                realTool++;
-                return { found: id };
+            echo: tool({
+              description: 'echo',
+              inputSchema: z.object({ v: z.number() }),
+              execute: async ({ v }: { v: number }) => {
+                toolCalls += 1;
+                return { v };
               },
             }),
           },
-          pricing: ({ inputTokens, outputTokens }) => inputTokens * 1e-5 + outputTokens * 3e-5,
+          pricing: ({ inputTokens }) => inputTokens * 1e-6,
         });
+        const spec: AgentSpec = { name: 'conf', engine: 'ai-sdk/tool-loop' };
         return {
-          engine: engine as never,
-          spec: { name: 'probe', engine: 'ai-sdk/tool-loop' } satisfies AgentSpec,
-          input: '查一下 1' as JsonValue,
-          realModelCalls: () => realModel,
-          realToolCalls: () => realTool,
+          engine,
+          spec,
+          input: 'go' as JsonValue,
+          realModelCalls: () => modelCalls,
+          realToolCalls: () => toolCalls,
         };
       },
     });
-
     expect(violations).toEqual([]);
-  });
+  }, 30_000);
 });

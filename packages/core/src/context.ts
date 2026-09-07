@@ -1,4 +1,4 @@
-/** 运行上下文，见 docs/architecture.md §4.8。占位：仅声明契约。 */
+/** 运行上下文，见 docs/architecture.md §4.8。 */
 import type { AgentEvent } from './events.js';
 
 export interface Logger {
@@ -27,23 +27,26 @@ export interface ConductorSource {
   taskId: string;
   taskReferenceName: string;
   correlationId?: string;
+  /** Conductor 的重试次数。>0 说明这是重试，previousAttempt 里有上次的 outputData */
   retryCount: number;
 }
 
 export interface RunContext {
-  /** 恢复锚点：`${workflowInstanceId}:${taskReferenceName}:${epoch}`（§5.2） */
-  readonly runKey: string;
+  /**
+   * 本次运行的标识 —— 就是 Conductor 的 **taskId**（ADR-0020）。
+   * 同一次执行的多次 callback 共享它；重试或新工作流实例则是新的。
+   */
   readonly runId: string;
+  /** Conductor 的 retryCount */
   readonly attempt: number;
-  /** callback 分片序号，从 0 开始 */
-  readonly sliceIndex: number;
   readonly tenantId?: string;
   readonly source?: ConductorSource;
 
-  /** 本次 run 的起点（跨分片保持不变），预算的时间维度以它为基准 */
+  /** 本次运行的起点，预算的时间维度以它为基准 */
   readonly startedAt: number;
+  /** startedAt + limits.wallClockMs */
   readonly deadline: number;
-  /** 取消 / 超时 / 预算耗尽统一经由此 signal 传播 */
+  /** 取消 / 超时 / 预算耗尽 / 工作流被终止，统一经由此 signal 传播 */
   readonly signal: AbortSignal;
 
   readonly logger: Logger;

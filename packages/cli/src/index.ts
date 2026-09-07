@@ -8,7 +8,7 @@
  *   ca spec explain <field>  说明某字段来自 L0/L1/L2 哪一层
  *   ca packs list            列出已装领域包及其贡献的扩展位
  *   ca run <agent> --input   本地跑一次 Agent（不连 Conductor）
- *   ca journal <runKey>      查看 / 回放 journal
- *   ca doctor                校验配置（yield 策略是否配了持久化 StateStore 等）
+ *   ca run <taskId>          查看某次运行的注册表记录（状态 / 心跳 / 进展 / 结果）
+ *   ca doctor                校验配置（多实例部署是否配了共享的 RunRegistry 等）
  */
 export {};

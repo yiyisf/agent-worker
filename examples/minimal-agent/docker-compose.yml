@@ -46,7 +46,7 @@ services:
       timeout: 5s
       retries: 20
 
-  # 我们自己的 StateStore：journal、租约与 fencing 都在这里（§8）
+  # 我们自己的运行注册表：谁在跑、心跳、进展、结果都在这里（§5.4）
   redis:
     image: redis:7-alpine
     container_name: ca-redis

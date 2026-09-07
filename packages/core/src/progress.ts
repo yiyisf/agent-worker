@@ -8,35 +8,34 @@
  * 把 token 流写进 task log 会瞬间打爆服务端，且不是编排引擎该消费的东西 ——
  * 编排引擎要的是「它还活着、走到哪了」，不是「它说了什么」。
  *
- * 本文件只做与宿主无关的节流与聚合；真正往 Conductor 写是 @ca/conductor 的事。
+ * 异步化之后进展有了新的关键作用：它同时是**运行还活着**的证据。
+ * 后台运行每产生一次进展就刷新一次注册表心跳，callback 据此判断宿主是否失联（ADR-0021）。
  */
-import type { JournalEntry } from './journal.js';
 
 export interface ProgressReport {
-  /** 语义化阶段名，由引擎适配器映射，如 'planning' | 'tool:lookupPolicy' | 'finalizing' */
+  /** 语义化阶段名，如 'model' | 'tool:lookupOrder' | 'done' */
   phase: string;
   /** 已完成的受管调用数 */
   step: number;
   /** 若可预知（plan-execute 类引擎）才有 */
   totalSteps?: number;
   usage: { tokens: number; costUsd: number };
-  sliceIndex: number;
   updatedAt: number;
 }
 
 export interface ProgressOptions {
-  /** 节流窗口，默认 15_000；phase 变化时立即写一次（leading edge），两者取或 */
+  /** 节流窗口，默认 15_000；phase 变化时立即放行（leading edge），两者取或 */
   intervalMs?: number;
-  /** 单个 run 的上报总量上限，默认 200；超限后只写阶段变化 */
+  /** 单个 run 的上报总量上限，默认 200；超限后只放行阶段变化 */
   maxReportsPerRun?: number;
 }
 
 export interface ProgressReporter {
-  /** 由受管入口与分片边界调用；内部节流合并 */
+  /** 由受管入口调用；内部节流合并 */
   report(r: ProgressReport): void;
-  /** 分片交还时取当前快照，写进 outputData.progress（权威通道，零额外请求） */
+  /** 取当前快照，写进 outputData.progress（权威通道，零额外请求） */
   snapshot(): ProgressReport | undefined;
-  /** 分片边界强制吐出被节流压住的最后一条 */
+  /** 强制吐出被节流压住的最后一条 */
   flush(): void;
 }
 
@@ -89,44 +88,4 @@ export function createThrottledReporter(
       if (pending) doEmit(pending);
     },
   };
-}
-
-/**
- * 从 journal 还原进展。
- *
- * ADR-0018 原本写的是「进展同时写 journal」，实现时改为**从已有条目推导** ——
- * 已完成的受管调用数与累计用量本来就在 journal 里，再写一份纯属重复，
- * 白白加重 §15.3 第 3 条关心的写放大。跨 taskId 重试时的续接摘要即由此产生。
- */
-export function progressFromJournal(entries: readonly JournalEntry[]): ProgressReport | undefined {
-  if (entries.length === 0) return undefined;
-  let step = 0;
-  let sliceIndex = 0;
-  let tokens = 0;
-  let costUsd = 0;
-  let phase = 'resumed';
-  let updatedAt = 0;
-
-  for (const e of entries) {
-    if (e.kind === 'model') {
-      step += 1;
-      tokens += e.usage.inputTokens + e.usage.outputTokens;
-      costUsd += e.usage.costUsd ?? 0;
-      phase = 'model';
-    } else if (e.kind === 'tool.result' || e.kind === 'tool.error') {
-      step += 1;
-      phase = `tool:${e.tool}`;
-    } else if (e.kind === 'slice') {
-      sliceIndex = e.index + 1;
-      tokens = e.budget.inputTokens + e.budget.outputTokens;
-      costUsd = e.budget.costUsd;
-      updatedAt = Math.max(updatedAt, 0);
-    } else if (e.kind === 'suspend') {
-      phase = 'suspended';
-      tokens = e.budget.inputTokens + e.budget.outputTokens;
-      costUsd = e.budget.costUsd;
-    }
-  }
-
-  return { phase, step, usage: { tokens, costUsd }, sliceIndex, updatedAt };
 }

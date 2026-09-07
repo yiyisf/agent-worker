@@ -1,49 +1,64 @@
 /**
- * 用户入口：把 AgentSpec 挂到 Conductor 上。见 docs/architecture.md §6.1。
+ * 用户入口：把 AgentSpec 挂到 Conductor 上。见 docs/architecture.md §6.1 与 ADR-0019/0020/0021。
  *
- * 本层是**薄桥接**（ADR-0006）：poll 循环、并发、心跳、指标、优雅停机全部交给官方
- * `@io-orkes/conductor-javascript` 的 TaskManager；这里只负责把 AgentSpec 编译成
- * 官方的 ConductorWorker，并在 execute 内外接上 journal / fencing / 结果映射 / 取消检测。
+ * 本层是**薄桥接**（ADR-0006）：poll 循环、并发、指标、优雅停机全部交给官方
+ * `@io-orkes/conductor-javascript` 的 TaskManager。
+ *
+ * execute() 的全部职责是**在毫秒内回答一个问题**：这个 taskId 的运行现在怎么样了？
+ * agent 本身在后台跑，与编排任务的执行窗口彻底解耦（ADR-0019）。
+ *
+ *   没有       → 取得所有权，后台发起运行，回执 IN_PROGRESS
+ *   正在跑     → 回执 IN_PROGRESS（带进展）
+ *   跑完了     → 回执 COMPLETED / FAILED
+ *   宿主失联   → 按 onOrphan 接管重跑或判失败
+ *
+ * 运行结束时后台会**直接** updateTask 把任务推向终态，不必等下一次 callback。
  */
 import {
-  MemoryStateStore,
+  AgentRunHost,
+  DEFAULT_CALLBACK_AFTER_SECONDS,
+  DEFAULT_ORPHAN_AFTER_MS,
+  MemoryRunRegistry,
   assertCapabilities,
-  decideResume,
-  progressFromJournal,
-  runSlice,
 } from '@ca/core';
 import type {
   AgentEngine,
   AgentSpec,
   BlobStore,
+  BuiltAgent,
+  ConductorSource,
   EventSink,
   JsonValue,
   Logger,
   ProgressReport,
-  RunContext,
-  StateStore,
+  RunOutcomeRecord,
+  RunRecord,
+  RunRegistry,
 } from '@ca/core';
-import { checkHandbackBudget } from './lease.js';
 import {
   createProgressReporter,
-  resumeSummaryLine,
+  priorAttemptLine,
   type ConductorProgressOptions,
   type TaskLogSink,
 } from './progress.js';
+import {
+  previousAttemptOf,
+  resolveInput,
+  doneOutput,
+  failedOutput,
+  runningOutput,
+  type ConductorTaskLike,
+  type ExternalInputResolver,
+} from './task-io.js';
 import { deriveTaskDef, taskTypeOf } from './taskdef.js';
-import { TerminalTaskError, toTaskResult, type MappedTaskResult, type ResultMapperOptions } from './result-mapper.js';
+import {
+  TerminalTaskError,
+  shrinkOutput,
+  type MappedTaskResult,
+  type ResultMapperOptions,
+} from './result-mapper.js';
 
-/** 官方 Task 的最小形状 —— 只取我们真正用到的字段，避免绑死 SDK 的生成类型 */
-export interface ConductorTaskLike {
-  taskId?: string;
-  workflowInstanceId?: string;
-  workflowType?: string;
-  referenceTaskName?: string;
-  correlationId?: string;
-  retryCount?: number;
-  startTime?: number;
-  inputData?: Record<string, unknown>;
-}
+export type { ConductorTaskLike, ExternalInputResolver } from './task-io.js';
 
 /** 官方 ConductorWorker 的形状（v4.0.0） */
 export interface CompiledWorker {
@@ -52,39 +67,51 @@ export interface CompiledWorker {
   domain?: string;
   concurrency?: number;
   pollInterval?: number;
-  leaseExtendEnabled?: boolean;
 }
 
-/** 恢复用的外部结果（如审批决定）从任务输入的这个约定字段读入 */
-export const RESUME_INPUT_KEY = '__caResume';
+/**
+ * 主动回执：后台运行结束时直接把任务推向终态。
+ * 已核实 `updateTask` 对调用方没有「必须是 poll 到它的 worker」的校验，
+ * 且 SCHEDULED（等待 callback 中）不是终态，所以任何持有 taskId 的进程都能推。
+ */
+export type UpdateTaskFn = (result: {
+  taskId: string;
+  workflowInstanceId: string;
+  status: 'COMPLETED' | 'FAILED';
+  outputData: Record<string, unknown>;
+  reasonForIncompletion?: string;
+}) => Promise<void>;
 
 export interface CompileDeps {
-  engines: readonly AgentEngine<never>[];
-  stateStore: StateStore;
+  engines: readonly AgentEngine[];
+  /**
+   * 运行注册表。默认单进程内存实现 —— **多实例部署必须换成共享实现**
+   * （@ca/memory 的 RedisRunRegistry）：Conductor 不保证 callback 回到同一个 worker。
+   */
+  registry?: RunRegistry;
+  /** 复用同一个后台宿主（多个 spec 共享时传入），不传则每个 worker 自建 */
+  host?: AgentRunHost;
   blobStore?: BlobStore;
   eventSinks?: readonly EventSink[];
   logger?: Logger;
   workerId?: string;
-  /**
-   * 进展的**尽力而为**通道（§10.4）：通常包一层官方 SDK 的 getTaskContext()?.addLog。
-   * 不提供则只写权威通道 outputData.progress。
-   */
+  /** 大输入取回器；不提供则遇到外置输入直接判终局失败（绝不静默空输入） */
+  externalInputResolver?: ExternalInputResolver;
+  /** 不提供则退化为「等下一次 callback 才回执」，正确但慢一个 callback 周期 */
+  updateTask?: UpdateTaskFn;
+  /** 进展的尽力而为通道（§10.4）；不提供则只写权威通道 outputData.progress */
   taskLogSink?: (task: ConductorTaskLike) => TaskLogSink | undefined;
   progress?: ConductorProgressOptions;
-  /** 额外的进展观察点（自建监控、StreamSink 等） */
   onProgress?: (task: ConductorTaskLike, report: ProgressReport) => void;
-  /** 取消检测：返回 true 表示该工作流已终止，应中止本次运行（§6.4） */
+  /** 取消检测：返回 true 表示该工作流已终止，应中止运行（§6.4） */
   isWorkflowCancelled?: (workflowInstanceId: string) => Promise<boolean>;
   resultMapper?: ResultMapperOptions;
 }
 
 const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
-/** runKey：恢复的锚点（§5.2）。epoch 由 resumePolicy 决定 */
-export function runKeyOf(spec: AgentSpec, task: ConductorTaskLike): string {
-  const policy = spec.conductor?.resumePolicy ?? 'on-lease-loss';
-  const epoch = policy === 'fresh-per-retry' ? (task.retryCount ?? 0) : 0;
-  return `${task.workflowInstanceId ?? 'wf'}:${task.referenceTaskName ?? spec.name}:${epoch}`;
+function progressOf(record: RunRecord | RunOutcomeRecord): ProgressReport | undefined {
+  return record.progress;
 }
 
 /**
@@ -106,165 +133,176 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
   });
   for (const w of check.warnings) logger.warn(`[${spec.name}] ${w}`);
 
-  const lease = spec.conductor?.leaseStrategy ?? 'callback';
-  if (lease !== 'lease-extend' && deps.stateStore instanceof MemoryStateStore) {
-    throw new Error(
-      `leaseStrategy='${lease}' 需要持久化 StateStore，但传入的是内存实现。` +
-        `内存实现只供本地开发 —— 分片一旦跨进程就会丢状态。请改用 @ca/memory 的 RedisStateStore。`,
-    );
-  }
+  const workerId = deps.workerId ?? `ca-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const registry = deps.registry ?? new MemoryRunRegistry();
+  const host =
+    deps.host ??
+    new AgentRunHost({
+      registry,
+      workerId,
+      logger,
+      ...(deps.eventSinks ? { eventSinks: deps.eventSinks } : {}),
+    });
 
-  const taskDef = deriveTaskDef(spec);
-  const workerId = deps.workerId ?? `ca-${process.pid}`;
-  const emit = (e: Parameters<EventSink['handle']>[0]) => {
-    for (const sink of deps.eventSinks ?? []) void sink.handle(e);
+  const callbackAfterSeconds = spec.conductor?.callbackAfterSeconds ?? DEFAULT_CALLBACK_AFTER_SECONDS;
+  const orphanAfterMs = spec.conductor?.orphanAfterMs ?? DEFAULT_ORPHAN_AFTER_MS;
+  const onOrphan = spec.conductor?.onOrphan ?? 'restart';
+
+  let built: BuiltAgent | undefined;
+
+  const finalize = async (
+    runId: string,
+    record: RunRecord | RunOutcomeRecord,
+  ): Promise<MappedTaskResult> => {
+    const progress = progressOf(record);
+    if (record.status === 'done') {
+      const output = await shrinkOutput(
+        doneOutput({ runId, result: record.result ?? null, progress }),
+        deps.resultMapper ?? {},
+      );
+      return { status: 'COMPLETED', outputData: output };
+    }
+    const error = record.error ?? { name: 'UnknownError', message: '运行失败但未记录原因', retryable: true };
+    const output = failedOutput({ runId, error, progress });
+    if (!error.retryable) throw new TerminalTaskError(error.message);
+    return {
+      status: 'FAILED',
+      outputData: output,
+      reasonForIncompletion: error.message.slice(0, 500),
+    };
   };
-
-  let built: Awaited<ReturnType<typeof engine.build>> | undefined;
 
   return {
     taskDefName: taskTypeOf(spec),
     ...(spec.conductor?.domain ? { domain: spec.conductor.domain } : {}),
-    ...(lease !== 'callback' ? { leaseExtendEnabled: true } : {}),
 
     async execute(task: ConductorTaskLike): Promise<MappedTaskResult> {
-      const runKey = runKeyOf(spec, task);
-      const now = Date.now();
+      // runId = taskId：同一次执行的多次 callback 共享它，重试则是新的（ADR-0020）
+      const runId = task.taskId;
+      if (!runId) {
+        throw new TerminalTaskError('任务缺少 taskId，无法标识本次运行');
+      }
 
-      // ── 抢占租约。抢不到说明别人正持有，立刻交还，不要并发跑（§5.3）──
-      const held = await deps.stateStore.acquire(runKey, workerId, taskDef.responseTimeoutSeconds * 1000);
-      if (!held) {
-        logger.warn(`[${spec.name}] ${runKey} 已被其它 worker 持有，交还任务`);
-        return { status: 'IN_PROGRESS', callbackAfterSeconds: 5, outputData: { state: 'contended' } };
+      const started = await registry.tryStart(runId, workerId, {
+        orphanAfterMs,
+        ...(onOrphan === 'fail' ? { maxAttempts: 1 } : {}),
+      });
+
+      // ── 别人正在跑：交还任务，下次 callback 再来看 ──
+      if (!started.ok && started.reason === 'running') {
+        return {
+          status: 'IN_PROGRESS',
+          callbackAfterSeconds,
+          outputData: runningOutput({
+            runId,
+            attempts: started.record.attempts,
+            progress: started.record.progress,
+          }),
+        };
+      }
+
+      // ── 已是终态：读结果直接回执（后台主动回执失败时的兜底路径）──
+      if (!started.ok) {
+        await registry.drop(runId);
+        return finalize(runId, started.record);
+      }
+
+      // ── 取得所有权：发起后台运行 ──
+      if (started.takeover) {
+        logger.warn(
+          `[${spec.name}] ${runId} 接管孤儿运行（第 ${started.record.attempts} 次）：` +
+            `上一个宿主超过 ${orphanAfterMs}ms 无心跳。整次运行将重新开始。`,
+        );
       }
 
       try {
-        // ── 取消检测：工作流已终止就别再烧 token（§6.4）──
-        if (deps.isWorkflowCancelled && task.workflowInstanceId) {
-          if (await deps.isWorkflowCancelled(task.workflowInstanceId)) {
-            throw new TerminalTaskError('所属工作流已终止，放弃本次运行');
-          }
-        }
-
-        // ── 恢复判据：看自己的 journal 有没有终态，不看 retryCount（ADR-0016）──
-        const history = await deps.stateStore.readJournal(runKey);
-        const decision = decideResume(history, spec.conductor?.resumePolicy ?? 'on-lease-loss');
-        if (decision.action === 'restart' && history.length > 0) {
-          logger.info(`[${spec.name}] ${runKey} 重开：${decision.reason}`);
-          await deps.stateStore.dropJournal(runKey);
-        }
-
+        const input = await resolveInput(task, deps.externalInputResolver);
+        const previousAttempt = previousAttemptOf(task);
         if (!built) built = await engine.build(spec, { logger });
 
-        const controller = new AbortController();
-        const wallClockMs = spec.limits?.wallClockMs ?? 300_000;
-        const ctx: RunContext = {
-          runKey,
-          runId: `${runKey}#${task.taskId ?? 'no-task'}`,
-          attempt: task.retryCount ?? 0,
-          sliceIndex: 0,
-          startedAt: task.startTime && task.startTime > 0 ? task.startTime : now,
-          deadline: (task.startTime && task.startTime > 0 ? task.startTime : now) + wallClockMs,
-          signal: controller.signal,
-          logger,
-          budget: {
-            usedInputTokens: 0,
-            usedOutputTokens: 0,
-            usedCostUsd: 0,
-            elapsedMs: 0,
-            remaining: () => Infinity,
-          },
-          secrets: { get: async () => undefined },
-          emit,
-          ...(task.workflowInstanceId
-            ? {
-                source: {
-                  workflowInstanceId: task.workflowInstanceId,
-                  workflowName: task.workflowType ?? '',
-                  taskId: task.taskId ?? '',
-                  taskReferenceName: task.referenceTaskName ?? '',
-                  ...(task.correlationId ? { correlationId: task.correlationId } : {}),
-                  retryCount: task.retryCount ?? 0,
-                },
-              }
-            : {}),
-        };
-
-        const resumeWith = task.inputData?.[RESUME_INPUT_KEY] as JsonValue | undefined;
-
-        // ── 进展反馈（§10.4 / ADR-0018）──
-        const progress = createProgressReporter(deps.taskLogSink?.(task), {
+        const reporter = createProgressReporter(deps.taskLogSink?.(task), {
           ...(deps.progress ?? {}),
           ...(deps.logger ? { logger: deps.logger } : {}),
         });
-        // 跨 taskId 重试会让 task log 断档（log 挂在 taskId 上，callback 交还不换 taskId），
-        // 所以新 task 实例的第一条日志把断点接上
-        if ((task.retryCount ?? 0) > 0) {
-          const prior = progressFromJournal(history);
-          if (prior && prior.step > 0) progress.report({ ...prior, phase: resumeSummaryLine(prior) });
+        // 重试换了新 taskId，task log 会断档；把上次 attempt 的落点接上（原生携带的 outputData）
+        const prior = (task.outputData?.progress as ProgressReport | undefined);
+        if ((task.retryCount ?? 0) > 0 && prior?.step) {
+          reporter.report({ ...prior, phase: priorAttemptLine(prior) });
         }
 
-        const outcome = await runSlice({
+        const source: ConductorSource | undefined = task.workflowInstanceId
+          ? {
+              workflowInstanceId: task.workflowInstanceId,
+              workflowName: task.workflowType ?? '',
+              taskId: runId,
+              taskReferenceName: task.referenceTaskName ?? '',
+              ...(task.correlationId ? { correlationId: task.correlationId } : {}),
+              retryCount: task.retryCount ?? 0,
+            }
+          : undefined;
+
+        host.start({
+          runId,
           spec,
           agent: built,
-          input: (task.inputData?.input ?? task.inputData ?? null) as JsonValue,
-          ctx,
-          store: deps.stateStore,
-          lease: held,
-          ...(resumeWith !== undefined ? { resumeWith } : {}),
+          input: input as JsonValue,
+          ...(previousAttempt !== undefined ? { previousAttempt } : {}),
+          attempt: task.retryCount ?? 0,
+          takeover: started.takeover,
+          ...(source ? { source } : {}),
+          ...(deps.progress ? { progressOptions: deps.progress } : {}),
           onProgress: (r) => {
-            progress.report(r);
+            reporter.report(r);
             deps.onProgress?.(task, r);
           },
-        });
-
-        // 分片边界把被节流压住的最后一条吐出来，再统一推给 Conductor
-        progress.flush();
-        await progress.drain();
-
-        // ── 交还预算：真正的约束是 Σ(执行 + 等待) < timeoutSeconds（§2.2）──
-        let callbackAfterSeconds: number | undefined;
-        if (outcome.kind === 'continue' || outcome.kind === 'suspended') {
-          const requested =
-            outcome.kind === 'suspended'
-              ? (outcome.awaiting.suggestedCallbackAfterSeconds ?? 30)
-              : 1;
-          const budgeted = checkHandbackBudget({
-            requestedCallbackAfterSeconds: requested,
-            taskStartTimeMs: ctx.startedAt,
-            timeoutSeconds: taskDef.timeoutSeconds,
-            now: Date.now(),
-          });
-          if (budgeted.willExceedTotalTimeout) {
-            logger.warn(
-              `[${spec.name}] ${runKey} 请求交还 ${requested}s 会撞上 timeoutSeconds=${taskDef.timeoutSeconds}，` +
-                `已夹到 ${budgeted.seconds}s。长等待场景需要相应放大 wallClockMs。`,
+          onHeartbeat: () => reporter.drain(),
+          ...(deps.isWorkflowCancelled && task.workflowInstanceId
+            ? { shouldAbort: () => deps.isWorkflowCancelled!(task.workflowInstanceId!) }
+            : {}),
+          onSettled: async (outcome) => {
+            reporter.flush();
+            await reporter.drain();
+            if (!deps.updateTask || !task.workflowInstanceId) return;
+            const mapped = await finalize(runId, outcome).catch((err) =>
+              // finalize 对终局错误抛 TerminalTaskError；主动回执路径上翻译成 FAILED
+              ({
+                status: 'FAILED' as const,
+                outputData: failedOutput({
+                  runId,
+                  error: { name: 'TerminalTaskError', message: String((err as Error).message), retryable: false },
+                  progress: outcome.progress,
+                }),
+                reasonForIncompletion: String((err as Error).message).slice(0, 500),
+              }),
             );
-          }
-          callbackAfterSeconds = budgeted.seconds;
-        } else {
-          // 终态：把租约让出来，下一个 runKey 不必等自然过期
-          await deps.stateStore.release(held);
-        }
-
-        return await toTaskResult(
-          {
-            outcome,
-            ...(callbackAfterSeconds !== undefined ? { callbackAfterSeconds } : {}),
-            ...(progress.snapshot()
-              ? { progress: progress.snapshot() as unknown as JsonValue }
-              : {}),
+            await deps.updateTask({
+              taskId: runId,
+              workflowInstanceId: task.workflowInstanceId,
+              status: mapped.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED',
+              outputData: mapped.outputData ?? {},
+              ...(mapped.reasonForIncompletion ? { reasonForIncompletion: mapped.reasonForIncompletion } : {}),
+            });
+            await registry.drop(runId);
           },
-          deps.resultMapper ?? {},
-        );
+        });
       } catch (err) {
-        // fence 落后就是别人接管了：不回写任何结果，交还任务让新 owner 继续
-        if ((err as Error)?.name === 'FencedOutError') {
-          logger.warn(`[${spec.name}] ${runKey} fence 落后，放弃回写`);
-          return { status: 'IN_PROGRESS', callbackAfterSeconds: 5, outputData: { state: 'fenced-out' } };
-        }
+        // 发起失败（输入取不回、引擎构建不出来）：立刻把注册表推向终态，
+        // 否则这条 running 记录会一直挂到 orphanAfterMs 才被发现
+        const message = (err as Error)?.message ?? String(err);
+        const retryable = !(err as Error)?.name?.includes('Terminal') &&
+          !(err as Error)?.name?.includes('ExternalInputUnavailable');
+        await registry.finish(runId, workerId, {
+          status: 'failed',
+          error: { name: (err as Error)?.name ?? 'Error', message, retryable },
+        });
         throw err;
       }
+
+      return {
+        status: 'IN_PROGRESS',
+        callbackAfterSeconds,
+        outputData: runningOutput({ runId, attempts: started.record.attempts }),
+      };
     },
   };
 }
@@ -277,6 +315,8 @@ export interface AgentWorkerOptions extends CompileDeps {
 export interface AgentWorker {
   workers: CompiledWorker[];
   taskDefs: ReturnType<typeof deriveTaskDef>[];
+  /** 后台宿主，供优雅停机时 drain */
+  host: AgentRunHost;
 }
 
 /**
@@ -285,12 +325,26 @@ export interface AgentWorker {
  * 刻意不在这里 new TaskManager：poll 循环、并发、优雅停机是官方 SDK 的职责，
  * 由调用方决定怎么装配（也便于混用已有的普通 worker）。用法：
  *
- *   const { workers, taskDefs } = createAgentWorker({ specs, engines, stateStore });
- *   await metadataClient.registerTaskDefs(taskDefs);
+ *   const { workers, taskDefs, host } = createAgentWorker({ specs, engines, updateTask });
+ *   for (const def of taskDefs) await metadataClient.registerTask(def);
  *   new TaskManager(client, workers, { options: { concurrency: 4 } }).startPolling();
+ *   // 停机：manager.stopPolling(); await host.drain();
  */
 export function createAgentWorker(options: AgentWorkerOptions): AgentWorker {
-  const workers = options.specs.map((spec) => compileAgentWorker(spec, options));
+  const logger = options.logger ?? noopLogger;
+  const workerId = options.workerId ?? `ca-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const registry = options.registry ?? new MemoryRunRegistry();
+  const host =
+    options.host ??
+    new AgentRunHost({
+      registry,
+      workerId,
+      logger,
+      ...(options.eventSinks ? { eventSinks: options.eventSinks } : {}),
+    });
+
+  const shared: CompileDeps = { ...options, registry, host, workerId, logger };
+  const workers = options.specs.map((spec) => compileAgentWorker(spec, shared));
   const taskDefs = options.specs.map((spec) => deriveTaskDef(spec));
-  return { workers, taskDefs };
+  return { workers, taskDefs, host };
 }

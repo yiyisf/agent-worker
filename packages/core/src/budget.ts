@@ -3,7 +3,9 @@
  *
  * 两种模式由引擎的 costVisibility 决定（§4.4）：
  *   per-call  每次模型调用前检查，超了就在调用**前**拦住
- *   per-turn  拦不到单次调用，只能在轮之间结账 —— 单轮内的超支不可控（§15.3 第 2 条）
+ *   per-turn  拦不到单次调用，只能在轮之间结账 —— 单轮内的超支不可控（§15.3）
+ *
+ * 一次运行从头跑到完成，所以用量天然是连续累计的，不需要跨调用回灌。
  */
 import type { AgentLimits } from './spec.js';
 import type { Usage } from './gateway.js';
@@ -33,10 +35,8 @@ export class BudgetGovernor implements BudgetView {
     private readonly limits: AgentLimits,
     private readonly startedAt: number,
     private readonly now: () => number = Date.now,
-    carried: Partial<BudgetSnapshot> = {},
   ) {
-    // 跨分片累计：上一分片的用量从 journal 回灌，否则每片都从 0 开始，限额形同虚设
-    this.used = { ...ZERO, ...carried };
+    this.used = { ...ZERO };
   }
 
   get usedInputTokens(): number {
@@ -86,7 +86,6 @@ export class BudgetGovernor implements BudgetView {
     }
   }
 
-  /** 记账。重放命中 journal 时也要记 —— 那笔钱在上一次尝试里已经花掉了。 */
   chargeModel(usage: Usage): void {
     this.used.modelCalls += 1;
     this.used.inputTokens += usage.inputTokens;

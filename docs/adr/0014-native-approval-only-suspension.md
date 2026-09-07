@@ -1,5 +1,10 @@
 # ADR-0014：挂起只走引擎原生审批，删除 `replay-signal`
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> 核实发现 `inputData` 在一个 task 实例的生命周期内是**冻结的**，外部决定根本无法在
+> callback 等待期间送达同一个任务 —— 本 ADR 描述的「交还 + 回灌」路径不可能实现。
+> 异步化之后挂起更简单：直接在运行内部 `await`（§4.7）。
+
 - 状态：Accepted（Amends [ADR-0012](0012-reliability-by-interception.md)）
 - 日期：2026-09-05
 

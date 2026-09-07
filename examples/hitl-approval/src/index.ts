@@ -1,13 +1,30 @@
 /**
- * 示例：native-approval 挂起 → Conductor callback 分片的同构映射。目标里程碑 M5。
+ * 示例：等待人工审批的 Agent。目标里程碑 M5。
  *
- * 演示：
- * - AI SDK 的 toolApproval 两段式审批天然落在 Conductor 分片边界上，不需要任何 hack（§4.7 A）：
- *     generate() 返回 tool-approval-request → EngineTurn { kind:'suspended' }
- *       → 持久化 messages 到 StateStore → IN_PROGRESS + callbackAfterSeconds 交还任务（释放槽位）
- *       → 审批系统写回决定 → 下次 poll 追加 tool-approval-response → 再跑一轮
- * - ⚠️ timeoutSeconds 必须覆盖「所有分片执行 + 所有等待」的总和，长审批要相应放大（§6.6、§2.2）
- * - effectful 工具在模糊重放时走 fail + 工作流补偿分支（ADR-0005）
+ * 异步化之后（ADR-0019）这件事变得很简单：agent 在后台跑，**它本来就可以等**。
+ *
+ * M1 就能用的做法 —— 把等待放进工具里（§4.7）：
+ *
+ *     tool({
+ *       execute: async (input, { idempotencyKey }) => {
+ *         const ticket = await approvals.create(input, idempotencyKey);
+ *         await approvals.waitUntilDecided(ticket);   // ← 等多久都行
+ *         if (!ticket.approved) throw new CaError('审批被拒', false);
+ *         return refunds.execute(input, { idempotencyKey });
+ *       },
+ *     })
+ *
+ * 期间：受管工具入口按 ToolPolicy.timeoutMs 计时（长审批要放大或设 0），
+ * 后台宿主照常心跳，execute() 照常回执 IN_PROGRESS，工作流在 UI 上看得到
+ * 「还活着、停在 tool:requestRefund」。等待期**不占任何 worker 并发槽**。
+ *
+ * M5 要补的是引擎级的两段式审批（capabilities.suspend = 'native-approval'）：
+ * AI SDK 的 toolApproval 让 generate() 返回 tool-approval-request 并结束本轮，
+ * 需要适配器在 run 内部接住、等决定、再继续。**这完全是适配器内部的事**，
+ * 桥接层不参与 —— 与 v0.6 把挂起做成 Conductor 交还有本质区别。
+ *
+ * ⚠️ 不要试图「交还任务 + 等外部把决定写回 inputData」：核实过 inputData 在一个
+ * task 实例的生命周期内是**冻结的**（updateTask 从不碰它），决定根本送不进来。
  *
  * M0 骨架：待实现
  */

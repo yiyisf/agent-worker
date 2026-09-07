@@ -4,14 +4,18 @@
  * 两条通道，可靠性分级：
  *
  *   通道一 outputData.progress（**权威**）
- *     callback 分片交还本身就是一次 task update，顺手把 ProgressReport 写进 outputData，
+ *     每次 callback 交还本身就是一次 task update，顺手把最新 ProgressReport 写进 outputData，
  *     零额外请求。这是唯一能被工作流消费的通道 —— 其他 task 可读
  *     ${agent_ref.output.progress.step} 做 SWITCH 分支、超时告警或通知。
- *     由 result-mapper 负责，不在本文件。
+ *     由 task-io 负责，不在本文件。
  *
  *   通道二 Conductor Task Log（**尽力而为**）
- *     经官方 SDK 的 getTaskContext()?.addLog()，优点是分片内也能写、不必等交还。
- *     但受三条服务端约束（v3.21.21 源码核实），只当作 UI 上的镜像，丢了不算故障。
+ *     经官方 SDK 的 getTaskContext()?.addLog()，优点是运行**中途**也能写，不必等 callback；
+ *     由后台宿主在每次心跳时顺带推出去。但受三条服务端约束（v3.21.21 源码核实），
+ *     只当作 UI 上的镜像，丢了不算故障。
+ *
+ * 异步化之后进展还兼任**心跳**：每产生一次进展就刷新一次注册表的 updatedAt，
+ * 失联判定（ADR-0021）建立在这上面。
  */
 import { createThrottledReporter, type ProgressOptions, type ProgressReport, type ProgressReporter } from '@ca/core';
 import type { Logger } from '@ca/core';
@@ -50,26 +54,27 @@ function truncate(s: string): string {
   return s.length <= TASK_LOG_LIMITS.maxChars ? s : `${s.slice(0, TASK_LOG_LIMITS.maxChars - 1)}…`;
 }
 
-/**
- * 一行结构化文本，**不放 payload、不放工具入参出参、不放任何密钥**。
- * 例：`[3/12] tool:lookupPolicy · 12.4k tok / $0.031 · slice 2`
- */
-export function formatProgressLine(r: ProgressReport): string {
-  const steps = r.totalSteps !== undefined ? `${r.step}/${r.totalSteps}` : String(r.step);
-  const tok = r.usage.tokens >= 1000 ? `${(r.usage.tokens / 1000).toFixed(1)}k` : String(r.usage.tokens);
-  const cost = r.usage.costUsd > 0 ? ` / $${r.usage.costUsd.toFixed(4)}` : '';
-  return truncate(`[${steps}] ${r.phase} · ${tok} tok${cost} · slice ${r.sliceIndex}`);
+function fmtUsage(u: ProgressReport['usage']): string {
+  const tok = u.tokens >= 1000 ? `${(u.tokens / 1000).toFixed(1)}k` : String(u.tokens);
+  return `${tok} tok${u.costUsd > 0 ? ` / $${u.costUsd.toFixed(4)}` : ''}`;
 }
 
 /**
- * 跨重试的连续性：task log 挂在 taskId 上。callback 交还不换 taskId，分片间连续；
- * 但 responseTimeout → TIMED_OUT → 重试会换新 taskId，日志就断了。
+ * 一行结构化文本，**不放 payload、不放工具入参出参、不放任何密钥**。
+ * 例：`[3/12] tool:lookupPolicy · 12.4k tok / $0.031`
+ */
+export function formatProgressLine(r: ProgressReport): string {
+  const steps = r.totalSteps !== undefined ? `${r.step}/${r.totalSteps}` : String(r.step);
+  return truncate(`[${steps}] ${r.phase} · ${fmtUsage(r.usage)}`);
+}
+
+/**
+ * 跨重试的连续性：task log 挂在 taskId 上，而重试会换新 taskId，日志就断了。
+ * 上一次 attempt 的进展由 Conductor 原生带在 task.outputData.progress 里，
  * 新 taskId 的第一条 log 由本函数生成，把断点接上。
  */
-export function resumeSummaryLine(prev: ProgressReport): string {
-  const tok = prev.usage.tokens >= 1000 ? `${(prev.usage.tokens / 1000).toFixed(1)}k` : String(prev.usage.tokens);
-  const cost = prev.usage.costUsd > 0 ? ` / $${prev.usage.costUsd.toFixed(4)}` : '';
-  return truncate(`↻ 从第 ${prev.step} 步恢复（已累计 ${tok} tok${cost}，slice ${prev.sliceIndex}）`);
+export function priorAttemptLine(prev: ProgressReport): string {
+  return truncate(`↻ 上次 attempt 停在第 ${prev.step} 步（${fmtUsage(prev.usage)}），本次重新开始`);
 }
 
 export interface ConductorProgressReporter extends ProgressReporter {

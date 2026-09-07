@@ -1,165 +1,206 @@
 /**
- * Redis 版 StateStore，见 docs/architecture.md §5.3、§8。
+ * Redis 版运行注册表，见 docs/architecture.md §5.3 与 ADR-0019/0021。
  *
- * 默认的 callback 分片策略要求持久化 StateStore —— 内存实现只供本地开发。
+ * **多实例部署必须用它。** Conductor 不保证 callback 回到同一个 worker
+ * （队列名只由 taskType[:domain] 构成，workerId 不参与路由，§2.2 已核实），
+ * 所以「这个 taskId 的运行现在在谁手上、跑到哪了」必须是共享状态。
  *
- * 三处必须用 Lua 而不是「读-判-写」的地方，都是因为 fencing 的正确性依赖原子性：
- *   acquire        判租约是否过期 + 递增 fenceToken 必须原子
- *   appendJournal  校验 fenceToken + 追加条目必须原子（否则会写进落后 worker 的数据）
- *   renew/release  同理，只有持有当前 fence 的人才能改
+ * tryStart 用 Lua 而不是「读-判-写」：并发的多个 worker 同时 poll 到同一个 taskId 时
+ * （60 秒 unack 窗口下真实存在），只有一个能拿到所有权，否则会并发跑两遍、重复付费。
  */
-import type { BlobStore, JournalEntry, LeaseRecord, StateStore } from '@ca/core';
-import { FencedOutError, sha256 } from '@ca/core';
+import type {
+  BlobStore,
+  RunOutcomeRecord,
+  RunRecord,
+  RunRegistry,
+  TryStartOptions,
+  TryStartResult,
+} from '@ca/core';
+import { DEFAULT_MAX_ATTEMPTS, DEFAULT_SETTLED_TTL_MS, sha256 } from '@ca/core';
 
 /** 只用到这几个命令，方便替换实现与测试 */
 export interface RedisLike {
   eval(script: string, numKeys: number, ...args: (string | number)[]): Promise<unknown>;
-  lrange(key: string, start: number, stop: number): Promise<string[]>;
   del(...keys: string[]): Promise<number>;
   get(key: string): Promise<string | null>;
   set(key: string, value: string, ...args: (string | number)[]): Promise<unknown>;
   quit(): Promise<unknown>;
 }
 
-export interface RedisStateStoreOptions {
+export interface RedisRunRegistryOptions {
   client: RedisLike;
   /** 键前缀，多租户/多环境共用一个 Redis 时用来隔离 */
   prefix?: string;
-  /** journal 的保留时长，默认 7 天（§8 的排障 TTL） */
-  journalTtlMs?: number;
+  /** 终态记录保留多久，默认 1 小时。必须远大于一次 callback 间隔 */
+  settledTtlMs?: number;
 }
 
 /**
- * 抢占：租约不存在、已过期、或本来就是自己的 → 递增 fence 并接管；
- * 否则返回 nil 表示抢不到（调用方必须立即放弃，不能并发跑）。
+ * 原子占位。四种结局：
+ *   1  取得所有权（新建）
+ *   2  取得所有权（接管孤儿）
+ *   3  别人正在跑
+ *   4  已是终态（含「重启次数用尽」——这条由脚本自己写入 failed）
  */
-const ACQUIRE = `
-local leaseKey, owner, ttl, now = KEYS[1], ARGV[1], tonumber(ARGV[2]), tonumber(ARGV[3])
-local cur = redis.call('HMGET', leaseKey, 'owner', 'fence', 'expiresAt')
-local fence = tonumber(cur[2])
-if fence ~= nil and cur[1] ~= owner and tonumber(cur[3]) > now then
-  return nil
+const TRY_START = `
+local key   = KEYS[1]
+local owner = ARGV[1]
+local now   = tonumber(ARGV[2])
+local orphanAfterMs = tonumber(ARGV[3])
+local maxAttempts   = tonumber(ARGV[4])
+local settledTtlMs  = tonumber(ARGV[5])
+
+local raw = redis.call('GET', key)
+if not raw then
+  local rec = cjson.encode({
+    status = 'running', owner = owner, startedAt = now, updatedAt = now, attempts = 1,
+  })
+  redis.call('SET', key, rec, 'PX', settledTtlMs)
+  return { 1, rec }
 end
-local nextFence = (fence or 0) + 1
-local expiresAt = now + ttl
-redis.call('HSET', leaseKey, 'owner', owner, 'fence', nextFence, 'expiresAt', expiresAt)
-redis.call('PEXPIRE', leaseKey, ttl + 86400000)
-return { nextFence, expiresAt }
+
+local rec = cjson.decode(raw)
+if rec.status ~= 'running' then
+  return { 4, raw }
+end
+
+if (now - rec.updatedAt) <= orphanAfterMs then
+  return { 3, raw }
+end
+
+if rec.attempts >= maxAttempts then
+  rec.status = 'failed'
+  rec.updatedAt = now
+  rec.error = {
+    name = 'OrphanedRunError',
+    message = '运行宿主连续失联，已达 maxAttempts，不再接管',
+    retryable = true,
+  }
+  local enc = cjson.encode(rec)
+  redis.call('SET', key, enc, 'PX', settledTtlMs)
+  return { 4, enc }
+end
+
+rec.owner = owner
+rec.updatedAt = now
+rec.attempts = rec.attempts + 1
+local enc = cjson.encode(rec)
+redis.call('SET', key, enc, 'PX', settledTtlMs)
+return { 2, enc }
 `;
 
-/** 续租：只有持有当前 fence 的人才能续 */
-const RENEW = `
-local leaseKey, fence, ttl, now = KEYS[1], tonumber(ARGV[1]), tonumber(ARGV[2]), tonumber(ARGV[3])
-if tonumber(redis.call('HGET', leaseKey, 'fence')) ~= fence then return nil end
-local expiresAt = now + ttl
-redis.call('HSET', leaseKey, 'expiresAt', expiresAt)
-redis.call('PEXPIRE', leaseKey, ttl + 86400000)
-return expiresAt
-`;
-
-/** 释放：把过期时间抹掉，让下一个 worker 能立刻接管 */
-const RELEASE = `
-local leaseKey, fence = KEYS[1], tonumber(ARGV[1])
-if tonumber(redis.call('HGET', leaseKey, 'fence')) ~= fence then return 0 end
-redis.call('HSET', leaseKey, 'expiresAt', 0)
+/** 心跳：只有当前 owner 能刷新。返回 0 表示所有权已易主，调用方应中止运行 */
+const HEARTBEAT = `
+local key, owner, now, progress, settledTtlMs =
+  KEYS[1], ARGV[1], tonumber(ARGV[2]), ARGV[3], tonumber(ARGV[5])
+local raw = redis.call('GET', key)
+if not raw then return 0 end
+local rec = cjson.decode(raw)
+if rec.owner ~= owner or rec.status ~= 'running' then return 0 end
+rec.updatedAt = now
+if progress ~= '' then rec.progress = cjson.decode(progress) end
+redis.call('SET', key, cjson.encode(rec), 'PX', settledTtlMs)
 return 1
 `;
 
-/**
- * 追加 journal：**先校验 fence 再写**，两步必须原子。
- * 返回当前 fence 供调用方在落后时构造精确的错误信息。
- */
-const APPEND = `
-local leaseKey, journalKey = KEYS[1], KEYS[2]
-local fence, ttl = tonumber(ARGV[1]), tonumber(ARGV[2])
-local cur = tonumber(redis.call('HGET', leaseKey, 'fence'))
-if cur ~= fence then return { 0, cur or 0 } end
-for i = 3, #ARGV do
-  redis.call('RPUSH', journalKey, ARGV[i])
-end
-redis.call('PEXPIRE', journalKey, ttl)
-return { 1, cur }
+/** 写终态：所有权已易主时忽略，避免旧 owner 覆盖新 owner 的结果 */
+const FINISH = `
+local key, owner, now, outcome, settledTtlMs =
+  KEYS[1], ARGV[1], tonumber(ARGV[2]), ARGV[3], tonumber(ARGV[4])
+local raw = redis.call('GET', key)
+if not raw then return 0 end
+local rec = cjson.decode(raw)
+if rec.owner ~= owner then return 0 end
+local o = cjson.decode(outcome)
+rec.status = o.status
+rec.updatedAt = now
+if o.result   ~= nil then rec.result   = o.result   end
+if o.error    ~= nil then rec.error    = o.error    end
+if o.progress ~= nil then rec.progress = o.progress end
+redis.call('SET', key, cjson.encode(rec), 'PX', settledTtlMs)
+return 1
 `;
 
-export class RedisStateStore implements StateStore {
+export class RedisRunRegistry implements RunRegistry {
+  private readonly client: RedisLike;
   private readonly prefix: string;
-  private readonly journalTtlMs: number;
+  private readonly settledTtlMs: number;
 
-  constructor(
-    private readonly opts: RedisStateStoreOptions,
-    private readonly now: () => number = Date.now,
-  ) {
+  constructor(opts: RedisRunRegistryOptions) {
+    this.client = opts.client;
     this.prefix = opts.prefix ?? 'ca';
-    this.journalTtlMs = opts.journalTtlMs ?? 7 * 24 * 3600_000;
+    this.settledTtlMs = opts.settledTtlMs ?? DEFAULT_SETTLED_TTL_MS;
   }
 
-  private leaseKey(runKey: string): string {
-    return `${this.prefix}:lease:${runKey}`;
-  }
-  private journalKey(runKey: string): string {
-    return `${this.prefix}:journal:${runKey}`;
+  private key(runId: string): string {
+    return `${this.prefix}:run:${runId}`;
   }
 
-  async acquire(runKey: string, owner: string, ttlMs: number): Promise<LeaseRecord | undefined> {
-    const res = (await this.opts.client.eval(
-      ACQUIRE,
+  private decode(runId: string, raw: string): RunRecord {
+    return { runId, ...(JSON.parse(raw) as Omit<RunRecord, 'runId'>) };
+  }
+
+  async tryStart(runId: string, owner: string, opts: TryStartOptions): Promise<TryStartResult> {
+    const res = (await this.client.eval(
+      TRY_START,
       1,
-      this.leaseKey(runKey),
+      this.key(runId),
       owner,
-      ttlMs,
-      this.now(),
-    )) as [number, number] | null;
-    if (!res) return undefined;
-    return { runKey, owner, fenceToken: Number(res[0]), expiresAt: Number(res[1]) };
+      Date.now(),
+      opts.orphanAfterMs,
+      opts.maxAttempts ?? DEFAULT_MAX_ATTEMPTS,
+      this.settledTtlMs,
+    )) as [number, string];
+
+    const [code, raw] = res;
+    const record = this.decode(runId, raw);
+    if (code === 1) return { ok: true, record, takeover: false };
+    if (code === 2) return { ok: true, record, takeover: true };
+    if (code === 3) return { ok: false, reason: 'running', record };
+    return { ok: false, reason: 'settled', record };
   }
 
-  async renew(lease: LeaseRecord, ttlMs: number): Promise<LeaseRecord | undefined> {
-    const res = (await this.opts.client.eval(
-      RENEW,
+  async heartbeat(
+    runId: string,
+    owner: string,
+    progress?: Parameters<RunRegistry['heartbeat']>[2],
+  ): Promise<boolean> {
+    const ok = (await this.client.eval(
+      HEARTBEAT,
       1,
-      this.leaseKey(lease.runKey),
-      lease.fenceToken,
-      ttlMs,
-      this.now(),
-    )) as number | null;
-    if (res == null) return undefined;
-    return { ...lease, expiresAt: Number(res) };
+      this.key(runId),
+      owner,
+      Date.now(),
+      progress ? JSON.stringify(progress) : '',
+      '',
+      this.settledTtlMs,
+    )) as number;
+    return ok === 1;
   }
 
-  async release(lease: LeaseRecord): Promise<void> {
-    await this.opts.client.eval(RELEASE, 1, this.leaseKey(lease.runKey), lease.fenceToken);
+  async get(runId: string): Promise<RunRecord | undefined> {
+    const raw = await this.client.get(this.key(runId));
+    return raw == null ? undefined : this.decode(runId, raw);
   }
 
-  async readJournal(runKey: string): Promise<JournalEntry[]> {
-    const raw = await this.opts.client.lrange(this.journalKey(runKey), 0, -1);
-    return raw.map((s) => JSON.parse(s) as JournalEntry);
+  async finish(runId: string, owner: string, outcome: RunOutcomeRecord): Promise<boolean> {
+    const ok = (await this.client.eval(
+      FINISH,
+      1,
+      this.key(runId),
+      owner,
+      Date.now(),
+      JSON.stringify(outcome),
+      this.settledTtlMs,
+    )) as number;
+    return ok === 1;
   }
 
-  async appendJournal(lease: LeaseRecord, entries: JournalEntry[]): Promise<void> {
-    if (entries.length === 0) return;
-    const res = (await this.opts.client.eval(
-      APPEND,
-      2,
-      this.leaseKey(lease.runKey),
-      this.journalKey(lease.runKey),
-      lease.fenceToken,
-      this.journalTtlMs,
-      ...entries.map((e) => JSON.stringify(e)),
-    )) as [number, number];
-    if (Number(res[0]) !== 1) {
-      throw new FencedOutError(lease.runKey, lease.fenceToken, Number(res[1]));
-    }
-  }
-
-  async dropJournal(runKey: string): Promise<void> {
-    await this.opts.client.del(this.journalKey(runKey));
+  async drop(runId: string): Promise<void> {
+    await this.client.del(this.key(runId));
   }
 }
 
-/**
- * Redis 版 BlobStore。大对象（transcript、超限 payload）走这里，
- * 但生产更适合放对象存储 —— Redis 只是让本地与小规模部署少一个依赖。
- */
 export class RedisBlobStore implements BlobStore {
   constructor(
     private readonly client: RedisLike,

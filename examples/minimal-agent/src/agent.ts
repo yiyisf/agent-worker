@@ -6,6 +6,8 @@
  *   2. AgentSpec 是纯数据，只声明「可靠性策略」而不是工具实现（ADR-0013）
  *   3. 默认用确定性的假模型 —— 验证不需要任何 LLM key。
  *      设了 ANTHROPIC_API_KEY 就自动换成真模型。
+ *
+ * agent 本身对 Conductor 一无所知：它就是一个跑完就返回的异步函数（ADR-0019）。
  */
 import { tool } from 'ai';
 import type { LanguageModel } from 'ai';
@@ -14,7 +16,7 @@ import { z } from 'zod';
 import { createAiSdkEngine } from '@ca/engine-ai-sdk';
 import type { AgentSpec } from '@ca/core';
 
-/** 计数器：端到端测试用它断言「重放时没有重复调用」 */
+/** 计数器：端到端测试用它断言「一次执行只跑一遍，多次 callback 不会重复发起」 */
 export const counters = { modelCalls: 0, toolCalls: 0 };
 
 const usage = (i: number, o: number) => ({
@@ -23,8 +25,9 @@ const usage = (i: number, o: number) => ({
 });
 
 /**
- * 假模型：先调一次工具，再给出结论。两步 —— 正好能观察分片与重放。
+ * 假模型：先调一次工具，再给出结论。两步。
  * 用假模型而不是真模型，是为了让验证**可重复且零成本**；真实性由 §11 的一致性套件保证。
+ * 第一步刻意慢一点，好让任务真的经历几次 IN_PROGRESS 的 callback。
  */
 function scriptedModel(): LanguageModel {
   let step = 0;
@@ -33,6 +36,7 @@ function scriptedModel(): LanguageModel {
     doGenerate: async () => {
       counters.modelCalls += 1;
       if (step++ === 0) {
+        await new Promise((r) => setTimeout(r, Number(process.env.CA_DEMO_DELAY_MS ?? 3_000)));
         return {
           content: [
             {
@@ -91,18 +95,21 @@ export const orderAgentSpec: AgentSpec = {
   name: 'order_assistant',
   engine: 'ai-sdk/tool-loop',
   toolPolicies: {
-    // 只读查询，重放时可以自由短路
+    // 只读查询：超时后重试是安全的
     lookupOrder: { effect: 'pure' },
   },
   limits: {
     maxCostUsd: 0.5,
+    // agent 自己的墙钟上限。与编排任务的超时无关 —— 那是引擎的事（§2.3）
     wallClockMs: 120_000,
-    // 故意设小，让这个两步的 Agent 至少分成两片 —— 便于观察分片与恢复
-    sliceMs: 1_000,
+    modelCallTimeoutMs: 60_000,
+    toolCallTimeoutMs: 30_000,
   },
   conductor: {
-    leaseStrategy: 'callback',
-    resumePolicy: 'on-lease-loss',
+    // 心跳节奏。设小只是为了让示例跑得快一点，生产默认 30s
+    callbackAfterSeconds: 2,
+    orphanAfterMs: 20_000,
+    onOrphan: 'restart',
   },
 };
 

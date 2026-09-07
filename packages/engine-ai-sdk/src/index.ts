@@ -1,8 +1,8 @@
 /**
  * @ca/engine-ai-sdk —— 适配 Vercel AI SDK 的 ToolLoopAgent。
- * 见 docs/architecture.md §4.3、ADR-0011、ADR-0012、ADR-0015。
+ * 见 docs/architecture.md §4.3、ADR-0011、ADR-0012、ADR-0019。
  *
- * 上游基线：**ai@^7.0.0**（ToolLoopAgent / toolApproval / V4 模型契约都是 v7 的能力，v5 没有）。
+ * 上游基线：**ai@^7.0.0**（ToolLoopAgent / V4 模型契约都是 v7 的能力，v5 没有）。
  *
  * 适配器的全部义务只有一条：**让模型调用与工具执行都经过受管入口**。
  * 除此之外的循环、上下文管理、停止条件、provider 生态，一律交给 AI SDK。
@@ -14,6 +14,7 @@
  */
 import { ToolLoopAgent, isStepCount, wrapLanguageModel } from 'ai';
 import type { LanguageModel, ModelMessage, StopCondition, ToolSet } from 'ai';
+import { CaError } from '@ca/core';
 import type {
   AgentEngine,
   AgentSpec,
@@ -21,15 +22,9 @@ import type {
   EngineBuildDeps,
   EngineCapabilities,
   EngineRunArgs,
-  EngineTurn,
   JsonValue,
   Usage,
 } from '@ca/core';
-
-/** 跨分片状态：AI SDK 的 messages 数组本身就是可序列化的对话状态 */
-export interface AiSdkState {
-  messages: ModelMessage[];
-}
 
 export interface AiSdkEngineOptions {
   model: LanguageModel;
@@ -40,8 +35,12 @@ export interface AiSdkEngineOptions {
    * 此时 limits.maxCostUsd 形同虚设 —— build 时会告警。
    */
   pricing?: (args: { modelId: string; inputTokens: number; outputTokens: number }) => number;
-  /** 需要人工审批的工具，映射到 EngineTurn.suspended（§4.7） */
-  toolApproval?: ConstructorParameters<typeof ToolLoopAgent>[0]['toolApproval'];
+  /**
+   * 自定义首轮消息。默认把 input 序列化成一条 user 消息。
+   * 重试时 previousAttempt 是上一次 attempt 的 outputData（Conductor 原生携带），
+   * 要不要参考它、怎么参考，是**业务判断**，所以交给调用方而不是由引擎猜。
+   */
+  buildMessages?: (args: { input: JsonValue; previousAttempt?: JsonValue }) => ModelMessage[];
 }
 
 export const AI_SDK_ENGINE_ID = 'ai-sdk/tool-loop';
@@ -51,13 +50,11 @@ export const aiSdkCapabilities: EngineCapabilities = {
   costVisibility: 'per-call',
   // 所有工具都是我们包装过的 tool({ execute })
   toolInterception: 'all',
-  // messages 数组就是状态
-  state: 'messages',
-  // toolApproval 的两段式审批与 Conductor callback 分片同构
-  suspend: 'native-approval',
-  // SliceBudget 翻译成 stopWhen 自定义谓词
-  sliceControl: 'native',
-  granularity: 'step',
+  /**
+   * M1 不做引擎级挂起。异步化之后一次运行从头跑到完成，需要等人的场景直接在**工具内部 await**
+   * 更简单也更可控（见 §4.7）；引擎级的两段式审批留到 M2。
+   */
+  suspend: 'none',
   progress: 'step',
   streaming: true,
   structuredOutput: true,
@@ -79,42 +76,29 @@ function toCaUsage(
 }
 
 /**
- * 模型请求里有不可（或不宜）参与哈希的字段：
- * abortSignal 是对象、headers 可能带每次不同的 trace id。
- * 留着它们会让 stepId 在重放时对不上。
+ * 模型请求里有不宜参与哈希的字段：abortSignal 是对象、headers 可能带每次不同的 trace id。
+ * 留着它们会让幂等键在同样的调用上算出不同的值。
  */
 function hashableParams(params: Record<string, unknown>): JsonValue {
   const { abortSignal: _a, headers: _h, ...rest } = params;
   return JSON.parse(JSON.stringify(rest)) as JsonValue;
 }
 
-/**
- * journal 是 JSON，Date 过一遍就变成字符串了。
- * 重放时把 response.timestamp 还原成 Date，避免把降级后的形状交回给 SDK。
- */
-function reviveGenerateResult(stored: unknown): unknown {
-  const r = stored as { response?: { timestamp?: unknown } };
-  if (r?.response?.timestamp && typeof r.response.timestamp === 'string') {
-    return { ...r, response: { ...r.response, timestamp: new Date(r.response.timestamp) } };
-  }
-  return stored;
-}
-
-function initialMessages(input: JsonValue): ModelMessage[] {
+function defaultMessages(input: JsonValue): ModelMessage[] {
   const text = typeof input === 'string' ? input : JSON.stringify(input);
   return [{ role: 'user', content: text }];
 }
 
-export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine<AiSdkState> {
+export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine {
   return {
     id: AI_SDK_ENGINE_ID,
     // ADR-0017：只在暴露给领域包的形状破坏性变化时 +1，与上游 ai 的版本号无关
-    contractVersion: 1,
+    contractVersion: 2,
     capabilities: aiSdkCapabilities,
     // ToolLoopAgent 没有内建工具，工具全部由我们声明，所以 toolInterception 才能是 'all'
     builtinTools: [],
 
-    async build(_spec: AgentSpec, deps: EngineBuildDeps): Promise<BuiltAgent<AiSdkState>> {
+    async build(_spec: AgentSpec, deps: EngineBuildDeps): Promise<BuiltAgent> {
       if (!opts.pricing) {
         deps.logger.warn(
           '未提供 pricing，costUsd 恒为 0 —— limits.maxCostUsd 将不起作用，只有 token 与时间维度生效',
@@ -122,7 +106,7 @@ export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine<AiSdkSt
       }
 
       return {
-        async run(args: EngineRunArgs<AiSdkState>): Promise<EngineTurn<AiSdkState>> {
+        async run(args: EngineRunArgs): Promise<JsonValue> {
           const { gateways, budget, ctx } = args;
           const modelId = typeof opts.model === 'string' ? opts.model : opts.model.modelId;
 
@@ -130,19 +114,17 @@ export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine<AiSdkSt
           const model = wrapLanguageModel({
             model: opts.model as Parameters<typeof wrapLanguageModel>[0]['model'],
             middleware: {
-              wrapGenerate: async ({ doGenerate, params }) => {
-                const stored = await gateways.model.guard(
+              wrapGenerate: async ({ doGenerate, params }) =>
+                gateways.model.guard(
                   hashableParams(params as unknown as Record<string, unknown>),
                   async () => {
                     const result = await doGenerate();
                     return {
-                      result: result as unknown as JsonValue,
+                      result,
                       usage: toCaUsage(result.usage as never, modelId, opts.pricing),
                     };
                   },
-                );
-                return reviveGenerateResult(stored) as Awaited<ReturnType<typeof doGenerate>>;
-              },
+                ),
             },
           });
 
@@ -165,11 +147,10 @@ export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine<AiSdkSt
             }),
           );
 
-          // ── 分片边界：SliceBudget 翻译成 stopWhen（ADR-0015）──
-          // 不由 core 强行打断 —— stopWhen 停在「最后一步有工具结果」这个干净点上，
-          // 停下后 responseMessages 直接就是可续跑的状态。
+          // 运行预算翻译成原生停止条件。不由 core 强行打断循环 ——
+          // 真正的硬闸门在受管入口上（超预算时下一次调用直接抛）。
           const deadline = Date.now() + budget.wallClockMs;
-          const sliceConditions: StopCondition<ToolSet>[] = [
+          const stopWhen: StopCondition<ToolSet>[] = [
             isStepCount(budget.maxModelCalls),
             () => Date.now() >= deadline,
           ];
@@ -178,52 +159,30 @@ export function createAiSdkEngine(opts: AiSdkEngineOptions): AgentEngine<AiSdkSt
             model,
             tools,
             ...(opts.system ? { system: opts.system } : {}),
-            ...(opts.toolApproval ? { toolApproval: opts.toolApproval } : {}),
-            stopWhen: sliceConditions,
+            stopWhen,
           });
 
-          const messages: ModelMessage[] = args.state?.messages ?? initialMessages(args.input);
-
-          // 恢复：把外部结果（如审批决定）作为一条 tool 消息追加，再跑一轮
-          if (args.resumeWith !== undefined) {
-            messages.push(args.resumeWith as unknown as ModelMessage);
-          }
+          const messages = opts.buildMessages
+            ? opts.buildMessages({
+                input: args.input,
+                ...(args.previousAttempt !== undefined ? { previousAttempt: args.previousAttempt } : {}),
+              })
+            : defaultMessages(args.input);
 
           const result = await agent.generate({ messages, abortSignal: ctx.signal });
 
-          // responseMessages 是跨步累计的完整对话；response.messages 只有最后一步
-          const next: AiSdkState = { messages: [...messages, ...result.responseMessages] };
-
-          // ── 挂起：原生两段式审批（§4.7）──
-          const approval = result.content.find((p) => p.type === 'tool-approval-request') as
-            | { approvalId: string; toolCall?: { toolName?: string; input?: unknown } }
-            | undefined;
-          if (approval) {
-            return {
-              kind: 'suspended',
-              state: next,
-              awaiting: {
-                kind: 'approval',
-                ref: approval.approvalId,
-                ...(approval.toolCall?.toolName ? { toolName: approval.toolCall.toolName } : {}),
-                ...(approval.toolCall?.input !== undefined
-                  ? { input: approval.toolCall.input as JsonValue }
-                  : {}),
-              },
-            };
+          // finishReason==='stop' 才是模型自己说完了。其余情况说明是我们的停止条件把它掐停的 ——
+          // 那不是「完成」，据实报失败，别把半截结果当成答案交给工作流。
+          if (result.finishReason !== 'stop') {
+            throw new CaError(
+              `agent 循环未自然结束（finishReason=${String(result.finishReason)}）：` +
+                `已达 maxModelCalls=${budget.maxModelCalls} 或 wallClockMs=${budget.wallClockMs}。` +
+                `请放宽 limits，或检查 agent 是否陷入了工具调用循环。`,
+              false,
+            );
           }
 
-          // ── 完成 vs 本分片跑满 ──
-          // finishReason==='stop' 才是模型自己说完了；其余（tool-calls 等）说明是我们的
-          // 分片条件把它停下的，下一片继续。
-          if (result.finishReason === 'stop') {
-            return {
-              kind: 'done',
-              output: { text: result.text, finishReason: result.finishReason } as JsonValue,
-              state: next,
-            };
-          }
-          return { kind: 'continue', state: next };
+          return { text: result.text, finishReason: result.finishReason } as JsonValue;
         },
       };
     },

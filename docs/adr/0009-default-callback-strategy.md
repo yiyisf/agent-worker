@@ -1,5 +1,9 @@
 # ADR-0009：默认租约策略选 `callback`
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> callback 仍是默认且唯一的模式，但语义变了：从「分片执行的续跑机会」变成「心跳检查」。
+> 正常路径上根本走不到它 —— 后台运行跑完会直接 `updateTask`。
+
 - 状态：Accepted（改写 [ADR-0007](0007-lease-strategies-revised.md) 的默认值，不改其策略集合）
 - 日期：2026-09-05
 

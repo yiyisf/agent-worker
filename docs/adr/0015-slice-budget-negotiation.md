@@ -1,5 +1,8 @@
 # ADR-0015：分片边界由 core 给预算、引擎翻译成原生停止条件
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。** 分片已删除。
+> `RunBudget` 保留了「core 给预算、引擎翻译成原生停止条件」的形式，但作用域是**整次运行**。
+
 - 状态：Accepted
 - 日期：2026-09-05
 

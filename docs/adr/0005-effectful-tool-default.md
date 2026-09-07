@@ -1,5 +1,10 @@
 # ADR-0005：effectful 工具在模糊重放时默认失败，而非重试
 
+> ℹ️ **Amended by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> 作用点从「模糊重放（journal 里只有 intent 没有 result）」改为「**受管工具入口超时**」：
+> `effectful` 工具超时按**不可重试**上报，因为副作用是否已生效同样未知。
+> 「默认不擅自重试、交给工作流的补偿分支决定」这条原则不变。
+
 - 状态：Accepted
 - 日期：2026-09-05
 

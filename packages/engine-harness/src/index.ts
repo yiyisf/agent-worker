@@ -46,11 +46,6 @@
  * 共同项：
  *   costVisibility: 'per-turn'
  *   toolInterception: 'host-declared-only'
- *   state: 'engine-session'   用 harness 的 session resume state（detach()/stop() 返回，
- *                             未完成的 turn 含 continuation state）；避免重复付费由它负责，
- *                             不是我们的 journal
- *   sliceControl: 'none'      一个 turn 不可中途拆分 → 一轮 = 一分片
- *   granularity: 'turn'
  *   progress: 'turn'          进展粒度只到 turn；适配器可把 lifecycle callbacks 与 stream 里的
  *                             tool-call 事件翻译成 phase（§10.4）——注意是翻译成进展，
  *                             不是把输出流转发给 Conductor

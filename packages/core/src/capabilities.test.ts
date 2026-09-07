@@ -8,10 +8,7 @@ import type { AgentSpec } from './spec.js';
 const toolLoop: EngineCapabilities = {
   costVisibility: 'per-call',
   toolInterception: 'all',
-  state: 'messages',
   suspend: 'native-approval',
-  sliceControl: 'native',
-  granularity: 'step',
   progress: 'step',
   streaming: true,
   structuredOutput: true,
@@ -21,10 +18,7 @@ const toolLoop: EngineCapabilities = {
 const harness: EngineCapabilities = {
   costVisibility: 'per-turn',
   toolInterception: 'host-declared-only',
-  state: 'engine-session',
   suspend: 'native-approval',
-  sliceControl: 'none',
-  granularity: 'turn',
   progress: 'turn',
   streaming: true,
   structuredOutput: true,
@@ -79,18 +73,9 @@ describe('能力—配置一致性校验（§4.4）', () => {
     expect(() => assertCapabilities(spec, codex)).toThrow(/不支持人工审批/);
   });
 
-  it('sliceControl=none 告警要按最坏单轮时长设 wallClockMs', () => {
-    const { warnings } = assertCapabilities(base(), harness);
-    expect(warnings.some((w) => w.includes('sliceControl'))).toBe(true);
-  });
-
-  it('callback 分片与 resumePolicy=never 矛盾 → 拒绝启动', () => {
-    const spec = base({ conductor: { leaseStrategy: 'callback', resumePolicy: 'never' } });
-    expect(() => assertCapabilities(spec, toolLoop)).toThrow(/矛盾/);
-  });
-
-  it('lease-extend + resumePolicy=never 是唯一合法的无 journal 组合', () => {
-    const spec = base({ conductor: { leaseStrategy: 'lease-extend', resumePolicy: 'never' } });
-    expect(() => assertCapabilities(spec, toolLoop)).not.toThrow();
+  it('progress=none 告警失联判定会变迟钝', () => {
+    const blind: EngineCapabilities = { ...harness, progress: 'none' };
+    const { warnings } = assertCapabilities(base(), blind);
+    expect(warnings.some((w) => w.includes('orphanAfterMs'))).toBe(true);
   });
 });

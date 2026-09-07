@@ -1,7 +1,7 @@
 {
   "name": "@ca/testing",
   "version": "0.0.0",
-  "description": "引擎一致性套件、脚本化模型、崩溃/并发/分片注入",
+  "description": "引擎一致性套件、注册表一致性套件、脚本化模型、失联/并发注入",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",

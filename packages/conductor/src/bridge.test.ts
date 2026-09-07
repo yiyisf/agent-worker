@@ -1,461 +1,338 @@
-import { afterAll, describe, expect, it } from 'vitest';
-import { Redis } from 'ioredis';
-import { MemoryStateStore } from '@ca/core';
-import type { AgentEngine, AgentSpec, EngineCapabilities, JsonValue } from '@ca/core';
-import { RedisStateStore, type RedisLike } from '@ca/memory';
-import {
-  DEFAULT_MAX_OUTPUT_BYTES,
-  MIN_RESPONSE_TIMEOUT_SECONDS,
-  TerminalTaskError,
-  assertExtendLeaseSupported,
-  checkHandbackBudget,
-  compileAgentWorker,
-  createCancellationWatcher,
-  deriveTaskDef,
-  diffTaskDefs,
-  runKeyOf,
-  supportsExtendLease,
-  toTaskResult,
-  type ConductorTaskLike,
-} from './index.js';
-
-const REDIS_URL = process.env.CA_TEST_REDIS_URL ?? 'redis://127.0.0.1:6380';
-const clients: Redis[] = [];
-
-const newClient = (): Redis => {
-  const c = new Redis(REDIS_URL, { lazyConnect: true, maxRetriesPerRequest: 1, retryStrategy: () => null });
-  clients.push(c);
-  return c;
-};
-
 /**
- * 需要 Redis 的用例在没有 Redis 时**跳过而不是失败** ——
- * 纯逻辑部分（TaskDef 推导、结果映射、取消检测）任何机器上都该能跑。
- * 本地起一个：redis-server --port 6380 --daemonize yes --save '' --appendonly no
+ * 桥接层的行为契约：**每次 callback 到底该回什么**（§6.1、ADR-0019/0020/0021）。
+ *
+ * 这是整个 SDK 最要紧的一组断言 —— 它定义了「同一次执行的多次 callback」
+ * 与「不同任务」如何被区分，以及运行结束时任务怎么被推向终态。
  */
-let redisReachable = false;
-try {
-  const probe = newClient();
-  await probe.connect();
-  await probe.ping();
-  redisReachable = true;
-} catch {
-  redisReachable = false;
-}
+import { describe, expect, it, vi } from 'vitest';
+import {
+  AgentRunHost,
+  BudgetExceededError,
+  MemoryRunRegistry,
+  type AgentEngine,
+  type BuiltAgent,
+  type JsonValue,
+} from '@ca/core';
+import { silentLogger } from '@ca/core/testkit';
+import { compileAgentWorker, type ConductorTaskLike, type UpdateTaskFn } from './worker.js';
+import { deriveTaskDef, diffTaskDefs } from './taskdef.js';
+import { ExternalInputUnavailableError, resolveInput } from './task-io.js';
 
-async function redisStore(): Promise<RedisStateStore> {
-  const c = newClient();
-  await c.connect();
-  return new RedisStateStore({ client: c as unknown as RedisLike, prefix: `ca-bridge-${Date.now()}` });
-}
+const settle = (ms = 30) => new Promise((r) => setTimeout(r, ms));
 
-afterAll(async () => {
-  await Promise.allSettled(clients.map((c) => c.quit()));
-});
-
-const caps: EngineCapabilities = {
-  costVisibility: 'per-call',
-  toolInterception: 'all',
-  state: 'messages',
-  suspend: 'native-approval',
-  sliceControl: 'native',
-  granularity: 'step',
-  progress: 'step',
-  streaming: false,
-  structuredOutput: false,
-};
-
-/** 一个最小引擎：跑 n 次模型调用，每片跑一次 */
-function fakeEngine(totalCalls: number, counter: { n: number }): AgentEngine<never> {
+function engineOf(run: BuiltAgent['run']): AgentEngine {
   return {
-    id: 'fake/engine',
+    id: 'test/engine',
     contractVersion: 1,
-    capabilities: caps,
+    capabilities: {
+      costVisibility: 'per-call',
+      toolInterception: 'all',
+      suspend: 'none',
+      progress: 'step',
+      streaming: false,
+      structuredOutput: false,
+    },
     builtinTools: [],
     async build() {
-      return {
-        async run({ gateways, state }) {
-          const done = ((state as { done?: number } | undefined)?.done ?? 0) as number;
-          await gateways.model.guard({ step: done }, async () => {
-            counter.n += 1;
-            return { result: { step: done }, usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.001 } };
-          });
-          const next = done + 1;
-          if (next >= totalCalls) return { kind: 'done', output: { steps: next } as JsonValue };
-          return { kind: 'continue', state: { done: next } as never };
-        },
-      };
+      return { run };
     },
   };
 }
 
-const spec = (over: Partial<AgentSpec> = {}): AgentSpec => ({
-  name: 'demo',
-  engine: 'fake/engine',
-  ...over,
-});
+const spec = { name: 'demo', engine: 'test/engine' } as const;
 
-const task = (over: Partial<ConductorTaskLike> = {}): ConductorTaskLike => ({
-  taskId: 't1',
-  workflowInstanceId: 'wf-1',
-  workflowType: 'demo_wf',
-  referenceTaskName: 'agent_ref',
-  retryCount: 0,
-  startTime: Date.now(),
-  inputData: { input: '干活' },
-  ...over,
-});
+function task(over: Partial<ConductorTaskLike> = {}): ConductorTaskLike {
+  return {
+    taskId: 'task-1',
+    workflowInstanceId: 'wf-1',
+    referenceTaskName: 'agent_ref',
+    retryCount: 0,
+    pollCount: 1,
+    inputData: { question: 'hi' },
+    ...over,
+  };
+}
 
-describe('TaskDef 推导（§6.6）', () => {
-  it('callback 策略下 responseTimeoutSeconds 有 30s 下限', () => {
-    // sliceMs=1s 推出来是 3s，会被夹到 30s：该值同时决定 decider 重扫频率，调小会加重服务端负载
-    const d = deriveTaskDef(spec({ limits: { sliceMs: 1_000, wallClockMs: 60_000 } }));
-    expect(d.responseTimeoutSeconds).toBe(MIN_RESPONSE_TIMEOUT_SECONDS);
-  });
-
-  it('sliceMs 较大时按 ×3 推导', () => {
-    const d = deriveTaskDef(spec({ limits: { sliceMs: 60_000 } }));
-    expect(d.responseTimeoutSeconds).toBe(180);
-  });
-
-  it('timeoutSeconds 覆盖 wallClockMs（含所有分片与等待）', () => {
-    const d = deriveTaskDef(spec({ limits: { wallClockMs: 600_000 } }));
-    expect(d.timeoutSeconds).toBe(720);
-  });
-
-  it('retryCount 不可为 0 —— 租约超时会消耗一次重试配额', () => {
-    expect(deriveTaskDef(spec()).retryCount).toBeGreaterThan(0);
-  });
-
-  it('lease-extend 下 responseTimeoutSeconds 故意设短（崩溃检测灵敏度）', () => {
-    const d = deriveTaskDef(spec({ conductor: { leaseStrategy: 'lease-extend' }, limits: { wallClockMs: 1_800_000 } }));
-    expect(d.responseTimeoutSeconds).toBe(60);
-    expect(d.timeoutSeconds).toBe(2160);
-  });
-
-  it('diffTaskDefs 报出线上漂移', () => {
-    // 默认 spec 没设 limits：sliceMs 取默认 60s，推出 180s（不触发 30s 下限）
-    const local = [deriveTaskDef(spec())];
-    expect(local[0]!.responseTimeoutSeconds).toBe(180);
-    const drift = diffTaskDefs(local, [{ name: local[0]!.name, responseTimeoutSeconds: 5 }]);
-    expect(drift).toEqual([
-      { name: local[0]!.name, field: 'responseTimeoutSeconds', local: 180, remote: 5 },
-    ]);
-  });
-});
-
-describe('extendLease 版本探测（ADR-0009）', () => {
-  it('3.10.6 不支持，3.10.7 起支持', () => {
-    expect(supportsExtendLease('3.10.6')).toBe(false);
-    expect(supportsExtendLease('3.10.7')).toBe(true);
-    expect(supportsExtendLease('3.21.21')).toBe(true);
-    expect(supportsExtendLease('v3.9.0')).toBe(false);
-  });
-
-  it('版本不足时拒绝启动并提示改用 callback', () => {
-    expect(() => assertExtendLeaseSupported('3.10.6')).toThrow(/callback/);
-    expect(() => assertExtendLeaseSupported('3.21.21')).not.toThrow();
-  });
-});
-
-describe('交还预算（§2.2：真正的约束是 Σ执行+等待 < timeoutSeconds）', () => {
-  const start = 1_000_000;
-
-  it('剩余时间充足时原样交还', () => {
-    const r = checkHandbackBudget({
-      requestedCallbackAfterSeconds: 30,
-      taskStartTimeMs: start,
-      timeoutSeconds: 600,
-      now: start + 10_000,
+describe('callback 协议', () => {
+  it('首次 callback：发起后台运行并立刻交还 IN_PROGRESS', async () => {
+    const registry = new MemoryRunRegistry();
+    let started = false;
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => {
+        started = true;
+        await settle(50);
+        return { answer: 42 };
+      })],
+      registry,
+      logger: silentLogger,
     });
-    expect(r).toEqual({ seconds: 30, clamped: false, willExceedTotalTimeout: false });
+
+    const t0 = Date.now();
+    const res = await worker.execute(task());
+
+    // execute 是毫秒级返回的 —— agent 还在后台跑
+    expect(Date.now() - t0).toBeLessThan(40);
+    expect(res.status).toBe('IN_PROGRESS');
+    expect(res.callbackAfterSeconds).toBe(30);
+    expect(res.outputData?.status).toBe('running');
+    expect(started).toBe(true);
   });
 
-  it('会撞上总超时时夹住并标记', () => {
-    const r = checkHandbackBudget({
-      requestedCallbackAfterSeconds: 3600,
-      taskStartTimeMs: start,
-      timeoutSeconds: 600,
-      now: start + 10_000,
+  it('同一 taskId 的后续 callback：报「正在跑」，不重复发起', async () => {
+    const registry = new MemoryRunRegistry();
+    let runs = 0;
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => {
+        runs += 1;
+        await settle(80);
+        return { answer: runs };
+      })],
+      registry,
+      logger: silentLogger,
     });
-    expect(r.clamped).toBe(true);
-    expect(r.willExceedTotalTimeout).toBe(true);
-    expect(r.seconds).toBeLessThan(600);
-    expect(r.seconds).toBeGreaterThan(0);
+
+    await worker.execute(task());
+    const second = await worker.execute(task({ pollCount: 2 }));
+    const third = await worker.execute(task({ pollCount: 3 }));
+
+    expect(second.status).toBe('IN_PROGRESS');
+    expect(third.status).toBe('IN_PROGRESS');
+    expect(runs).toBe(1);
   });
 
-  it('总时间已经耗尽时交还 0', () => {
-    const r = checkHandbackBudget({
-      requestedCallbackAfterSeconds: 30,
-      taskStartTimeMs: start,
-      timeoutSeconds: 60,
-      now: start + 120_000,
+  it('不同 taskId 是不同的执行：重试会重新发起', async () => {
+    const registry = new MemoryRunRegistry();
+    let runs = 0;
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => {
+        runs += 1;
+        await settle(10);
+        return runs;
+      })],
+      registry,
+      logger: silentLogger,
     });
-    expect(r.seconds).toBe(0);
-    expect(r.willExceedTotalTimeout).toBe(true);
+
+    await worker.execute(task({ taskId: 'task-1' }));
+    await worker.execute(task({ taskId: 'task-2', retryCount: 1 }));
+    await settle(60);
+    expect(runs).toBe(2);
   });
-});
 
-describe('结果映射（§6.2）', () => {
-  const budget = { inputTokens: 10, outputTokens: 5, costUsd: 0.01, toolCalls: 1, modelCalls: 2 };
-
-  it('done → COMPLETED', async () => {
-    const r = await toTaskResult({
-      outcome: { kind: 'done', output: { answer: 42 }, budget, sliceIndex: 0 },
+  it('运行完成后的 callback：回执 COMPLETED 并带上结果', async () => {
+    const registry = new MemoryRunRegistry();
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => ({ answer: 42 }))],
+      registry,
+      logger: silentLogger,
     });
-    expect(r.status).toBe('COMPLETED');
-    expect(r.outputData?.ok).toBe(true);
-    expect(r.outputData?.result).toEqual({ answer: 42 });
-    expect(r.outputData?.slices).toBe(1);
+
+    await worker.execute(task());
+    await settle(60);
+
+    const done = await worker.execute(task({ pollCount: 2 }));
+    expect(done.status).toBe('COMPLETED');
+    expect(done.outputData?.ok).toBe(true);
+    expect(done.outputData?.result).toEqual({ answer: 42 });
   });
 
-  it('continue → IN_PROGRESS 并带 callbackAfterSeconds', async () => {
-    const r = await toTaskResult({
-      outcome: { kind: 'continue', budget, sliceIndex: 1 },
-      callbackAfterSeconds: 3,
+  it('运行结束时**主动**推向终态，不等下一次 callback', async () => {
+    const registry = new MemoryRunRegistry();
+    const updateTask = vi.fn<UpdateTaskFn>(async () => {});
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => ({ answer: 7 }))],
+      registry,
+      logger: silentLogger,
+      updateTask,
     });
-    expect(r.status).toBe('IN_PROGRESS');
-    expect(r.callbackAfterSeconds).toBe(3);
-    expect(r.outputData?.state).toBe('continue');
+
+    await worker.execute(task());
+    await settle(60);
+
+    expect(updateTask).toHaveBeenCalledTimes(1);
+    const call = updateTask.mock.calls[0]![0]!;
+    expect(call.taskId).toBe('task-1');
+    expect(call.workflowInstanceId).toBe('wf-1');
+    expect(call.status).toBe('COMPLETED');
+    expect((call.outputData as { result?: unknown }).result).toEqual({ answer: 7 });
   });
 
-  it('suspended → IN_PROGRESS 并把 awaiting 与 resumeToken 暴露给工作流', async () => {
-    const r = await toTaskResult({
-      outcome: {
-        kind: 'suspended',
-        awaiting: { kind: 'approval', ref: 'appr-1', toolName: 'refund' },
-        resumeToken: 'unsigned.abc',
-        budget,
-        sliceIndex: 0,
-      },
-      callbackAfterSeconds: 60,
+  it('可重试失败 → FAILED，交给 TaskDef.retryCount 决定重试', async () => {
+    const registry = new MemoryRunRegistry();
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => {
+        throw new Error('下游超时');
+      })],
+      registry,
+      logger: silentLogger,
     });
-    expect(r.status).toBe('IN_PROGRESS');
-    expect((r.outputData?.awaiting as { ref: string }).ref).toBe('appr-1');
-    expect(r.outputData?.resumeToken).toBe('unsigned.abc');
+
+    await worker.execute(task());
+    await settle(40);
+    const res = await worker.execute(task({ pollCount: 2 }));
+
+    expect(res.status).toBe('FAILED');
+    expect(res.reasonForIncompletion).toContain('下游超时');
+    expect(res.outputData?.ok).toBe(false);
   });
 
-  it('瞬时错误 → FAILED（交给 TaskDef 重试）', async () => {
-    const r = await toTaskResult({
-      outcome: {
-        kind: 'failed',
-        error: { name: 'CaError', message: '429 rate limited', retryable: true },
-        budget,
-        sliceIndex: 0,
-      },
+  it('终局失败 → 抛 TerminalTaskError，由调用方转成 NonRetryableException', async () => {
+    const registry = new MemoryRunRegistry();
+    const worker = compileAgentWorker(spec, {
+      // 预算耗尽是终局的：再跑一次还是会超
+      engines: [engineOf(async () => {
+        throw new BudgetExceededError('cost');
+      })],
+      registry,
+      logger: silentLogger,
     });
-    expect(r.status).toBe('FAILED');
-    expect(r.reasonForIncompletion).toContain('429');
+
+    await worker.execute(task());
+    await settle(40);
+    await expect(worker.execute(task({ pollCount: 2 }))).rejects.toThrow(/budget exceeded/);
   });
 
-  it('终局错误 → 抛 TerminalTaskError（调用方转成 NonRetryableException）', async () => {
-    await expect(
-      toTaskResult({
-        outcome: {
-          kind: 'failed',
-          error: { name: 'AmbiguousReplayError', message: '副作用未知', retryable: false },
-          budget,
-          sliceIndex: 0,
-        },
-      }),
-    ).rejects.toBeInstanceOf(TerminalTaskError);
-  });
-
-  it('超预算的输出外置到 BlobStore，outputData 只留 ref', async () => {
-    const stored: string[] = [];
-    const blobStore = {
-      async put(_k: string, body: Uint8Array | string) {
-        stored.push(String(body));
-        return { ref: 'blob://x', bytes: String(body).length, sha256: 'deadbeef' };
-      },
-      async get() {
-        return new Uint8Array();
-      },
-    };
-    const big = { blob: 'x'.repeat(DEFAULT_MAX_OUTPUT_BYTES + 10) };
-    const r = await toTaskResult(
-      { outcome: { kind: 'done', output: big as JsonValue, budget, sliceIndex: 0 } },
-      { blobStore, payloadStrategy: 'externalize' },
+  it('宿主失联后由另一个 worker 接管重跑，不消耗 Conductor 重试配额', async () => {
+    // 共享注册表 + 两个独立宿主 = 集群部署下「callback 落到别的 worker」的真实形态
+    const registry = new MemoryRunRegistry();
+    let runs = 0;
+    const engines = [engineOf(async () => {
+      runs += 1;
+      await settle(200);
+      return runs;
+    })];
+    const conductor = { orphanAfterMs: 0 };
+    const workerA = compileAgentWorker(
+      { ...spec, conductor },
+      { engines, registry, logger: silentLogger, workerId: 'A',
+        host: new AgentRunHost({ registry, workerId: 'A', logger: silentLogger }) },
     );
-    expect(r.outputData?.transcriptRef).toBe('blob://x');
-    expect((r.outputData?.result as { externalized: boolean }).externalized).toBe(true);
-    expect(stored).toHaveLength(1);
-  });
-});
+    const workerB = compileAgentWorker(
+      { ...spec, conductor },
+      { engines, registry, logger: silentLogger, workerId: 'B',
+        host: new AgentRunHost({ registry, workerId: 'B', logger: silentLogger }) },
+    );
 
-describe('Worker 编译（不需要 Redis）', () => {
-  it('runKey 由 resumePolicy 决定 epoch（§5.2）', () => {
-    const t = task({ retryCount: 3 });
-    expect(runKeyOf(spec(), t)).toBe('wf-1:agent_ref:0');
-    expect(runKeyOf(spec({ conductor: { resumePolicy: 'fresh-per-retry' } }), t)).toBe('wf-1:agent_ref:3');
-  });
+    await workerA.execute(task());
+    await settle(5);
+    // orphanAfterMs=0：A 的心跳还没来得及刷新就被判失联，B 接管
+    const second = await workerB.execute(task({ pollCount: 2 }));
 
-  it('callback 策略 + 内存 StateStore → 启动即拒绝', () => {
-    expect(() =>
-      compileAgentWorker(spec(), {
-        engines: [fakeEngine(1, { n: 0 })],
-        stateStore: new MemoryStateStore(),
-      }),
-    ).toThrow(/持久化 StateStore/);
-  });
-});
-
-describe.skipIf(!redisReachable)('Worker 执行（需要 Redis）', () => {
-
-  it('引擎未注册 → 启动即拒绝', async () => {
-    const store = await redisStore();
-    expect(() =>
-      compileAgentWorker(spec({ engine: 'nope' }), {
-        engines: [fakeEngine(1, { n: 0 })],
-        stateStore: store,
-      }),
-    ).toThrow(/未注册/);
+    expect(second.status).toBe('IN_PROGRESS');
+    expect(runs).toBe(2);
+    // 关键：taskId 没变，retryCount 也没变 —— 这不是 Conductor 的重试
+    expect(second.outputData?.runId).toBe('task-1');
+    expect(second.outputData?.attempts).toBe(2);
   });
 
-  it('单片跑完 → COMPLETED', async () => {
-    const counter = { n: 0 };
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(1, counter)],
-      stateStore: await redisStore(),
-    });
-    const r = await worker.execute(task());
-    expect(r.status).toBe('COMPLETED');
-    expect(counter.n).toBe(1);
-    expect(worker.taskDefName).toBe('agent_demo');
-  });
-
-  it('多片：第一片交还、第二片完成，且不重复调用模型', async () => {
-    const counter = { n: 0 };
-    const store = await redisStore();
-    const worker = compileAgentWorker(spec(), { engines: [fakeEngine(2, counter)], stateStore: store });
-    const t = task();
-
-    const first = await worker.execute(t);
-    expect(first.status).toBe('IN_PROGRESS');
-    expect(first.callbackAfterSeconds).toBeGreaterThanOrEqual(0);
-    expect(counter.n).toBe(1);
-
-    const second = await worker.execute(t);
-    expect(second.status).toBe('COMPLETED');
-    // 第二片只新增了一次模型调用：第一片那次被 journal 短路了
-    expect(counter.n).toBe(2);
-    expect(second.outputData?.slices).toBe(2);
-  });
-
-  it('租约被别人持有时交还任务，不并发跑', async () => {
-    const counter = { n: 0 };
-    const store = await redisStore();
-    const worker = compileAgentWorker(spec(), { engines: [fakeEngine(1, counter)], stateStore: store });
-    const t = task();
-    // 别的 worker 先占住
-    await store.acquire(runKeyOf(spec(), t), 'someone-else', 60_000);
-
-    const r = await worker.execute(t);
-    expect(r.status).toBe('IN_PROGRESS');
-    expect(r.outputData?.state).toBe('contended');
-    expect(counter.n).toBe(0);
-  });
-
-  it('工作流已终止时不再烧 token（§6.4）', async () => {
-    const counter = { n: 0 };
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(1, counter)],
-      stateStore: await redisStore(),
-      isWorkflowCancelled: async () => true,
-    });
-    await expect(worker.execute(task())).rejects.toBeInstanceOf(TerminalTaskError);
-    expect(counter.n).toBe(0);
-  });
-});
-
-describe('取消检测（§6.4）', () => {
-  it('同工作流的并发查询合并成一次请求', async () => {
-    let calls = 0;
-    const { isWorkflowCancelled } = createCancellationWatcher({
-      getStatus: async () => {
-        calls += 1;
-        return 'RUNNING';
+  it('onOrphan=fail：失联即判失败，不接管', async () => {
+    const registry = new MemoryRunRegistry();
+    let runs = 0;
+    const worker = compileAgentWorker(
+      { ...spec, conductor: { orphanAfterMs: 0, onOrphan: 'fail' } },
+      {
+        engines: [engineOf(async () => {
+          runs += 1;
+          await settle(100);
+          return runs;
+        })],
+        registry,
+        logger: silentLogger,
       },
-    });
-    const results = await Promise.all(Array.from({ length: 5 }, () => isWorkflowCancelled('wf-1')));
-    expect(results.every((r) => r === false)).toBe(true);
-    expect(calls).toBe(1);
-  });
-
-  it('命中终止状态才判取消', async () => {
-    const { isWorkflowCancelled } = createCancellationWatcher({ getStatus: async () => 'TERMINATED' });
-    expect(await isWorkflowCancelled('wf-9')).toBe(true);
-  });
-
-  it('查询失败不判取消 —— 网络抖动不该让正常运行的 Agent 被判死', async () => {
-    const { isWorkflowCancelled } = createCancellationWatcher({
-      getStatus: async () => {
-        throw new Error('network');
-      },
-    });
-    expect(await isWorkflowCancelled('wf-2')).toBe(false);
-  });
-});
-
-describe.skipIf(!redisReachable)('进展反馈接进 worker（需要 Redis，§10.4 / ADR-0018）', () => {
-  it('权威通道：outputData.progress 随分片交还一起写出，零额外请求', async () => {
-    const store = await redisStore();
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(2, { n: 0 })],
-      stateStore: store,
-      progress: { intervalMs: 0 },
-    });
-    const t = task();
-
-    const first = await worker.execute(t);
-    expect(first.status).toBe('IN_PROGRESS');
-    const p = first.outputData?.progress as { step: number; usage: { tokens: number } };
-    expect(p.step).toBeGreaterThan(0);
-    expect(p.usage.tokens).toBe(15);
-
-    const second = await worker.execute(t);
-    expect((second.outputData?.progress as { step: number }).step).toBeGreaterThanOrEqual(p.step);
-  });
-
-  it('尽力而为通道：进展写进 task log，且单次不超过 10 条', async () => {
-    const batches: string[][] = [];
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(1, { n: 0 })],
-      stateStore: await redisStore(),
-      progress: { intervalMs: 0 },
-      taskLogSink: () => ({ addLogs: (lines) => void batches.push(lines) }),
-    });
-    await worker.execute(task());
-    expect(batches.length).toBeGreaterThan(0);
-    for (const b of batches) expect(b.length).toBeLessThanOrEqual(10);
-    // 日志是给人看的一行文本，不该是 payload
-    expect(batches.flat().every((l) => typeof l === 'string' && l.length <= 512)).toBe(true);
-  });
-
-  it('跨 taskId 重试时补一条续接摘要，把断档接上', async () => {
-    const store = await redisStore();
-    const lines: string[] = [];
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(3, { n: 0 })],
-      stateStore: store,
-      progress: { intervalMs: 0 },
-      taskLogSink: () => ({ addLogs: (batch) => void lines.push(...batch) }),
-    });
+    );
 
     await worker.execute(task());
-    lines.length = 0;
-    // responseTimeout → TIMED_OUT → 重试：新 taskId、retryCount +1，task log 从头开始
-    await worker.execute(task({ taskId: 't2', retryCount: 1 }));
-    expect(lines.some((l) => l.includes('从第') && l.includes('步恢复'))).toBe(true);
+    await settle(5);
+    const second = await worker.execute(task({ pollCount: 2 }));
+
+    expect(second.status).toBe('FAILED');
+    expect(runs).toBe(1);
   });
 
-  it('没有 taskLogSink 时只走权威通道，不报错', async () => {
-    const worker = compileAgentWorker(spec(), {
-      engines: [fakeEngine(1, { n: 0 })],
-      stateStore: await redisStore(),
+  it('缺少 taskId 直接判终局失败 —— 没有它就无法标识本次运行', async () => {
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async () => null)],
+      registry: new MemoryRunRegistry(),
+      logger: silentLogger,
     });
-    const r = await worker.execute(task());
-    expect(r.status).toBe('COMPLETED');
-    expect(r.outputData?.progress).toBeDefined();
+    const { taskId: _drop, ...noId } = task();
+    await expect(worker.execute(noId)).rejects.toThrow(/taskId/);
+  });
+});
+
+describe('运行态输入输出', () => {
+  it('inputData 原样就是 agent 的输入，没有保留键', async () => {
+    const registry = new MemoryRunRegistry();
+    let seen: JsonValue;
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async (a) => {
+        seen = a.input;
+        return null;
+      })],
+      registry,
+      logger: silentLogger,
+    });
+    await worker.execute(task({ inputData: { question: 'hi', orderId: 'A-1001' } }));
+    await settle(30);
+    expect(seen!).toEqual({ question: 'hi', orderId: 'A-1001' });
+  });
+
+  it('重试时上一次 attempt 的 outputData 由引擎原生带来，交给 agent 做业务判断', async () => {
+    const registry = new MemoryRunRegistry();
+    let seen: JsonValue | undefined;
+    const worker = compileAgentWorker(spec, {
+      engines: [engineOf(async (a) => {
+        seen = a.previousAttempt;
+        return null;
+      })],
+      registry,
+      logger: silentLogger,
+    });
+    await worker.execute(
+      task({ taskId: 'task-2', retryCount: 1, outputData: { ok: false, error: { message: '上次失败了' } } }),
+    );
+    await settle(30);
+    expect(seen).toEqual({ ok: false, error: { message: '上次失败了' } });
+  });
+
+  it('输入被服务端外置且没有 resolver → 明确失败，绝不静默当成空输入', async () => {
+    await expect(
+      resolveInput({ taskId: 't', inputData: {}, externalInputPayloadStoragePath: 's3://x/y' }),
+    ).rejects.toThrow(ExternalInputUnavailableError);
+  });
+
+  it('配了 resolver 就把大输入取回来', async () => {
+    const got = await resolveInput(
+      { taskId: 't', inputData: {}, externalInputPayloadStoragePath: 's3://x/y' },
+      async (p) => ({ from: p, doc: 'big' }),
+    );
+    expect(got).toEqual({ from: 's3://x/y', doc: 'big' });
+  });
+});
+
+describe('TaskDef 推导（注册期）', () => {
+  it('长任务不设总时长上限，responseTimeout 保持服务端默认', () => {
+    const def = deriveTaskDef(spec);
+    expect(def.name).toBe('agent_demo');
+    // 0 = checkTaskTimeout 直接 return，任务不会因为跑太久被判超时
+    expect(def.timeoutSeconds).toBe(0);
+    // 刻意不调小：调小会抢在队列 unack 前把任务判 TIMED_OUT 并消耗一次 retryCount
+    expect(def.responseTimeoutSeconds).toBe(3600);
+    expect(def.retryCount).toBeGreaterThan(0);
+  });
+
+  it('需要硬 SLA 上限时可显式指定', () => {
+    const def = deriveTaskDef({ ...spec, conductor: { taskTimeoutSeconds: 900 } as never });
+    expect(def.timeoutSeconds).toBe(900);
+  });
+
+  it('线上 TaskDef 漂移能被检出（运维视角，不影响运行）', () => {
+    const local = [deriveTaskDef(spec)];
+    expect(diffTaskDefs(local, [{ ...local[0]!, retryCount: 0 }])).toEqual([
+      { name: 'agent_demo', field: 'retryCount', local: 3, remote: 0 },
+    ]);
+    expect(diffTaskDefs(local, [])).toEqual([
+      { name: 'agent_demo', field: '*', local: 'defined', remote: 'missing' },
+    ]);
   });
 });

@@ -7,10 +7,8 @@
  * 用到的官方 API（均按 @io-orkes/conductor-javascript@4.0.0 的类型核实）：
  *   orkesConductorClient(config)              客户端
  *   MetadataClient.registerTask(taskDef)      注册 TaskDef
- *   WorkflowExecutor.registerWorkflow(o, def) 注册工作流
- *   WorkflowExecutor.startWorkflow(req)       触发一次运行
- *   WorkflowExecutor.getWorkflow(id, bool)    查状态（取消检测 + 断言）
- *   TaskClient.addTaskLog(taskId, message)    进展的尽力而为通道
+ *   WorkflowExecutor.registerWorkflow/startWorkflow/getWorkflow
+ *   TaskClient.addTaskLog / getTaskLogs       进展的尽力而为通道
  *   TaskManager(client, workers, config)      poll 循环
  */
 import { Redis } from 'ioredis';
@@ -21,9 +19,10 @@ import {
   WorkflowExecutor,
   orkesConductorClient,
 } from '@io-orkes/conductor-javascript';
-import { RedisStateStore, type RedisLike } from '@ca/memory';
+import { RedisRunRegistry, type RedisLike } from '@ca/memory';
+import { MemoryRunRegistry, type RunRegistry } from '@ca/core';
 import { createAgentWorker, createCancellationWatcher, deriveTaskDef } from '@ca/conductor';
-import type { CompiledWorker } from '@ca/conductor';
+import type { AgentWorker, UpdateTaskFn } from '@ca/conductor';
 import { TASK_TYPE, WORKFLOW_NAME, buildEngine, orderAgentSpec } from './agent.js';
 
 export const CONDUCTOR_URL = process.env.CONDUCTOR_SERVER_URL ?? 'http://localhost:8080/api';
@@ -47,7 +46,8 @@ export const workflowDef = {
       name: TASK_TYPE,
       taskReferenceName: 'agent_ref',
       type: 'SIMPLE',
-      inputParameters: { input: '${workflow.input.question}' },
+      // inputData 原样就是 agent 的输入，没有保留键、没有 __ca 命名空间（§6.5）
+      inputParameters: { question: '${workflow.input.question}' },
     },
   ],
   outputParameters: {
@@ -55,39 +55,68 @@ export const workflowDef = {
     // 进展的权威通道就在 outputData 里，工作流可以直接消费（§10.4）
     progress: '${agent_ref.output.progress}',
     usage: '${agent_ref.output.usage}',
-    slices: '${agent_ref.output.slices}',
+    runId: '${agent_ref.output.runId}',
   },
 };
 
-/**
- * TaskDef 由 limits 推导，避免「代码里 2 分钟、TaskDef 里 60 秒」这类超时错配（§6.6）。
- * 这里能直接看到 30s 下限的效果：spec 的 sliceMs 是 1s，×3 = 3s，被夹到 30s。
- */
 export async function registerMetadata(): Promise<void> {
   const client = await conductorClient();
-  const metadata = new MetadataClient(client);
-  const executor = new WorkflowExecutor(client);
-
-  const taskDef = deriveTaskDef(orderAgentSpec);
-  await metadata.registerTask(taskDef as never);
-  await executor.registerWorkflow(true, workflowDef as never);
+  await new MetadataClient(client).registerTask(deriveTaskDef(orderAgentSpec) as never);
+  await new WorkflowExecutor(client).registerWorkflow(true, workflowDef as never);
 }
 
-export interface Wiring {
-  workers: CompiledWorker[];
-  redis: Redis;
+/**
+ * 主动回执：后台运行结束时直接把任务推向终态，不等下一次 callback（§5.2）。
+ *
+ * 这里用裸 REST 而不是 TaskClient.updateTaskResult，只因为后者按
+ * (workflowId, taskRefName) 定位任务，而我们要的是**精确到 taskId**：
+ * 万一这中间任务已被重试，按 refName 更新会打到新的那一个。
+ */
+export function makeUpdateTask(): UpdateTaskFn {
+  return async ({ taskId, workflowInstanceId, status, outputData, reasonForIncompletion }) => {
+    const res = await fetch(`${CONDUCTOR_URL}/tasks`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        taskId,
+        workflowInstanceId,
+        status,
+        outputData,
+        ...(reasonForIncompletion ? { reasonForIncompletion } : {}),
+      }),
+    });
+    if (!res.ok) throw new Error(`updateTask 失败：HTTP ${res.status} ${await res.text()}`);
+  };
+}
+
+export interface Wiring extends AgentWorker {
+  redis?: Redis;
   close: () => Promise<void>;
 }
 
-/** 完整装配：worker + 进展两通道 + 取消检测 */
+/**
+ * 完整装配。
+ *
+ * 注册表：连得上 Redis 就用共享实现，否则退回单进程内存实现。
+ * 这不是可选优化 —— 多 worker 实例部署时 Conductor **不保证** callback 回到同一个进程，
+ * 内存注册表会让每个实例各跑一遍。
+ */
 export async function buildWiring(): Promise<Wiring> {
   const client = await conductorClient();
   const engine = await buildEngine();
   const executor = new WorkflowExecutor(client);
   const tasks = new TaskClient(client);
 
-  const redis = new Redis(REDIS_URL, { lazyConnect: true });
-  await redis.connect();
+  let redis: Redis | undefined;
+  let registry: RunRegistry = new MemoryRunRegistry();
+  try {
+    const r = new Redis(REDIS_URL, { lazyConnect: true, retryStrategy: () => null });
+    await r.connect();
+    redis = r;
+    registry = new RedisRunRegistry({ client: r as unknown as RedisLike, prefix: 'ca-demo' });
+  } catch {
+    console.warn(`   （连不上 Redis(${REDIS_URL})，退回单进程内存注册表 —— 仅适用于单实例）`);
+  }
 
   const { isWorkflowCancelled } = createCancellationWatcher({
     getStatus: async (id) => {
@@ -96,12 +125,13 @@ export async function buildWiring(): Promise<Wiring> {
     },
   });
 
-  const { workers } = createAgentWorker({
+  const wired = createAgentWorker({
     specs: [orderAgentSpec],
-    engines: [engine as never],
-    stateStore: new RedisStateStore({ client: redis as unknown as RedisLike, prefix: 'ca-demo' }),
+    engines: [engine],
+    registry,
     logger: console,
     isWorkflowCancelled,
+    updateTask: makeUpdateTask(),
     // 进展的尽力而为通道（§10.4）。写失败不影响主流程 —— 权威通道是 outputData.progress
     taskLogSink: (task) =>
       task.taskId
@@ -115,10 +145,11 @@ export async function buildWiring(): Promise<Wiring> {
   });
 
   return {
-    workers,
-    redis,
+    ...wired,
+    ...(redis ? { redis } : {}),
     close: async () => {
-      await redis.quit();
+      await wired.host.drain();
+      await redis?.quit();
     },
   };
 }
@@ -135,8 +166,7 @@ export async function startPolling(wiring: Wiring): Promise<TaskManager> {
 
 export async function startRun(question: string): Promise<string> {
   const client = await conductorClient();
-  const executor = new WorkflowExecutor(client);
-  return executor.startWorkflow({
+  return new WorkflowExecutor(client).startWorkflow({
     name: WORKFLOW_NAME,
     version: 1,
     input: { question },
@@ -146,11 +176,10 @@ export async function startRun(question: string): Promise<string> {
 export async function getWorkflow(workflowId: string): Promise<{
   status?: string;
   output?: Record<string, unknown>;
-  tasks?: { taskId?: string; status?: string; callbackAfterSeconds?: number }[];
+  tasks?: { taskId?: string; status?: string; pollCount?: number; outputData?: Record<string, unknown> }[];
 }> {
   const client = await conductorClient();
-  const executor = new WorkflowExecutor(client);
-  return (await executor.getWorkflow(workflowId, true)) as never;
+  return (await new WorkflowExecutor(client).getWorkflow(workflowId, true)) as never;
 }
 
 export async function getTaskLogs(taskId: string): Promise<{ log?: string }[]> {

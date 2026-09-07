@@ -3,14 +3,14 @@
  *
  * 它把「支持任意 SDK」从口号变成可验证的契约。最关键的一条是
  * **声明的 capabilities 与实际行为一致** —— 适配器谎报能力会让用户
- * 误以为拿到了 effectively-once 与调用级成本管控，比不支持更危险。
+ * 误以为拿到了调用级成本管控与副作用保护，比不支持更危险。
  *
  * 刻意做成返回违规列表的纯函数，而不是 describe/it：
  * 这样才能反过来测「套件本身抓不抓得住一个说谎的引擎」。
  */
-import { MemoryStateStore, runSlice } from '@ca/core';
-import type { AgentEngine, AgentSpec, JsonValue, Logger } from '@ca/core';
-import { makeContext, silentLogger } from '@ca/core/testkit';
+import { runAgent } from '@ca/core';
+import type { AgentEngine, AgentEvent, AgentSpec, JsonValue, Logger } from '@ca/core';
+import { silentLogger, testContext } from '@ca/core/testkit';
 
 export interface ConformanceViolation {
   rule: string;
@@ -21,10 +21,10 @@ export interface ConformanceFixture {
   /**
    * 每次调用都要造一个**全新**的引擎，并暴露底层真实调用的计数器。
    * 计数器必须统计「真的打到模型 / 真的执行了工具」的次数，
-   * 而不是经过受管入口的次数 —— 后者在重放时也会走到。
+   * 而不是经过受管入口的次数 —— 两者的差值正是本套件要检查的东西。
    */
   create(): Promise<{
-    engine: AgentEngine<never>;
+    engine: AgentEngine;
     spec: AgentSpec;
     input: JsonValue;
     realModelCalls(): number;
@@ -33,128 +33,119 @@ export interface ConformanceFixture {
   logger?: Logger;
 }
 
-const RUN_KEY = 'conformance:agent_ref:0';
-
-async function runOnce(
-  fixture: ConformanceFixture,
-  store: MemoryStateStore,
-  owner: string,
-  sliceBudget?: { maxModelCalls?: number },
-) {
+async function runOnce(fixture: ConformanceFixture, specOver: Partial<AgentSpec> = {}) {
   const made = await fixture.create();
-  const lease = await store.acquire(RUN_KEY, owner, 60_000);
-  if (!lease) throw new Error('conformance: 抢不到租约');
-  const agent = await made.engine.build(made.spec, { logger: fixture.logger ?? silentLogger });
-  const outcome = await runSlice({
-    spec: made.spec,
+  const spec: AgentSpec = { ...made.spec, ...specOver, limits: { ...made.spec.limits, ...specOver.limits } };
+  const events: AgentEvent[] = [];
+  const agent = await made.engine.build(spec, { logger: fixture.logger ?? silentLogger });
+  const outcome = await runAgent({
+    spec,
     agent,
     input: made.input,
-    ctx: makeContext({ runKey: RUN_KEY }),
-    store,
-    lease,
-    ...(sliceBudget ? { sliceBudget } : {}),
+    ctx: testContext({ emit: (e) => events.push(e) }),
   });
-  return { made, outcome };
+  const managedModelCalls = events.filter((e) => e.type === 'model.call').length;
+  const managedToolCalls = events.filter((e) => e.type === 'tool.started').length;
+  return { made, outcome, events, managedModelCalls, managedToolCalls };
 }
 
 /**
- * 跑完返回违规列表；空数组表示这个引擎名副其实。
- *
- * fixture 应当提供一个「两次模型调用 + 一次工具调用后结束」的脚本，
- * 这样分片与重放两条断言才有东西可查。
+ * 检查一个引擎适配器是否守住了它自己声明的契约。
+ * 返回空数组即通过；否则每条违规都指明「哪条规则、实际怎样」。
  */
 export async function checkEngineConformance(
   fixture: ConformanceFixture,
 ): Promise<ConformanceViolation[]> {
-  const violations: ConformanceViolation[] = [];
-  const push = (rule: string, detail: string) => violations.push({ rule, detail });
+  const v: ConformanceViolation[] = [];
+  const probe = await fixture.create();
+  const caps = probe.engine.capabilities;
 
-  // ── 1. 首跑：受管入口是否真的被用上 ──
-  const store = new MemoryStateStore();
-  const { made, outcome } = await runOnce(fixture, store, 'w1');
-  const caps = made.engine.capabilities;
-  const journal = await store.readJournal(RUN_KEY);
-  const modelEntries = journal.filter((e) => e.kind === 'model').length;
-  const toolEntries = journal.filter((e) => e.kind === 'tool.result' || e.kind === 'tool.error').length;
-  const realModel = made.realModelCalls();
-  const realTool = made.realToolCalls();
-
-  if (outcome.kind === 'failed') {
-    push('fixture', `首跑就失败了，后续断言无从进行：${outcome.error.message}`);
-    return violations;
+  if (!Number.isInteger(probe.engine.contractVersion) || probe.engine.contractVersion < 1) {
+    v.push({
+      rule: 'contractVersion',
+      detail: `contractVersion 必须是 ≥1 的整数，实际 ${String(probe.engine.contractVersion)}`,
+    });
   }
 
+  // ── 规则 1：跑得通 ──
+  const base = await runOnce(fixture);
+  if (base.outcome.kind !== 'done') {
+    v.push({
+      rule: 'baseline',
+      detail: `基准运行没有成功完成：${JSON.stringify(base.outcome)}`,
+    });
+    return v; // 基准都跑不通，后面的检查没有意义
+  }
+
+  // ── 规则 2：costVisibility='per-call' 必须每次模型调用都经过受管入口 ──
   if (caps.costVisibility === 'per-call') {
-    if (realModel > 0 && modelEntries === 0) {
-      push(
-        'costVisibility',
-        `声明 per-call，但底层发生了 ${realModel} 次模型调用而 journal 里一条 model 条目都没有 —— ` +
-          `模型调用没有经过受管入口，journal 与预算都形同虚设`,
-      );
-    } else if (modelEntries < realModel) {
-      push('costVisibility', `声明 per-call，但 ${realModel} 次真实调用只有 ${modelEntries} 条进了 journal`);
+    const real = base.made.realModelCalls();
+    if (real !== base.managedModelCalls) {
+      v.push({
+        rule: 'costVisibility=per-call',
+        detail:
+          `真实模型调用 ${real} 次，但只有 ${base.managedModelCalls} 次经过受管入口。` +
+          `差额部分完全不受预算管控 —— 要么修适配器，要么把 costVisibility 降级为 'per-turn'。`,
+      });
+    }
+    if (base.outcome.budget.modelCalls !== base.managedModelCalls) {
+      v.push({
+        rule: 'costVisibility=per-call',
+        detail: `记账的模型调用数（${base.outcome.budget.modelCalls}）与受管入口计数（${base.managedModelCalls}）不一致`,
+      });
     }
   }
 
-  if (caps.toolInterception === 'all' && realTool > 0 && toolEntries < realTool) {
-    push(
-      'toolInterception',
-      `声明 all，但 ${realTool} 次真实工具执行只有 ${toolEntries} 条进了 journal —— 幂等保护实际不存在`,
-    );
-  }
-
-  // ── 2. 重放：journal 应当短路掉全部真实调用 ──
-  const replayStore = new MemoryStateStore();
-  const replayLease = await replayStore.acquire(RUN_KEY, 'w-replay', 60_000);
-  await replayStore.appendJournal(
-    replayLease!,
-    journal.filter((e) => e.kind !== 'final' && e.kind !== 'failed'),
-  );
-  const replayMade = await fixture.create();
-  const replayAgent = await replayMade.engine.build(replayMade.spec, {
-    logger: fixture.logger ?? silentLogger,
-  });
-  const replayOutcome = await runSlice({
-    spec: replayMade.spec,
-    agent: replayAgent,
-    input: replayMade.input,
-    ctx: makeContext({ runKey: RUN_KEY }),
-    store: replayStore,
-    lease: replayLease!,
-  });
-
-  if (replayMade.realModelCalls() > 0) {
-    push(
-      'replay',
-      `重放时底层仍发生了 ${replayMade.realModelCalls()} 次模型调用 —— 会重复付费。` +
-        `通常是模型调用没走 gateways.model.guard，或引擎循环在重放时走了不同分支`,
-    );
-  }
-  if (replayMade.realToolCalls() > 0) {
-    push('replay', `重放时底层仍执行了 ${replayMade.realToolCalls()} 次工具 —— 会重复产生副作用`);
-  }
-  if (replayOutcome.kind !== outcome.kind) {
-    push('replay', `重放结果与首跑不一致：首跑 ${outcome.kind}，重放 ${replayOutcome.kind}`);
-  }
-
-  // ── 3. 分片：声明 native 就必须真的受 SliceBudget 约束 ──
-  if (caps.sliceControl === 'native' && realModel > 1) {
-    const sliceStore = new MemoryStateStore();
-    const sliced = await runOnce(fixture, sliceStore, 'w-slice', { maxModelCalls: 1 });
-    const usedModel = sliced.made.realModelCalls();
-    if (usedModel > 1) {
-      push(
-        'sliceControl',
-        `声明 native，但 maxModelCalls=1 时底层仍调了 ${usedModel} 次模型 —— SliceBudget 没有被翻译成停止条件`,
-      );
-    }
-    if (sliced.outcome.kind === 'done') {
-      push(
-        'sliceControl',
-        `声明 native，但分片预算耗尽时直接返回了 done，应当返回 continue 让下一分片接着跑`,
-      );
+  // ── 规则 3：toolInterception='all' 必须每次工具执行都经过受管入口 ──
+  if (caps.toolInterception === 'all') {
+    const real = base.made.realToolCalls();
+    if (real !== base.managedToolCalls) {
+      v.push({
+        rule: 'toolInterception=all',
+        detail:
+          `真实工具执行 ${real} 次，但只有 ${base.managedToolCalls} 次经过受管入口。` +
+          `差额部分没有幂等键、没有超时、不计入预算 —— 应改声明为 'host-declared-only'。`,
+      });
     }
   }
 
-  return violations;
+  // ── 规则 4：预算是硬闸门，不是事后统计 ──
+  const capped = await runOnce(fixture, { limits: { maxCostUsd: 1e-12, maxTotalTokens: 1 } });
+  if (capped.outcome.kind !== 'failed') {
+    v.push({
+      rule: 'budget-enforced',
+      detail: '把 maxTotalTokens 压到 1 之后运行仍然成功完成，说明预算闸门没有生效',
+    });
+  }
+  if (capped.made.realModelCalls() > base.made.realModelCalls()) {
+    v.push({
+      rule: 'budget-enforced',
+      detail: '预算被压到极小之后真实调用次数反而更多，说明闸门位置不对',
+    });
+  }
+
+  // ── 规则 5：取消信号必须被尊重 ──
+  const cancelled = await (async () => {
+    const made = await fixture.create();
+    const controller = new AbortController();
+    controller.abort(new Error('cancelled by conformance suite'));
+    const agent = await made.engine.build(made.spec, { logger: fixture.logger ?? silentLogger });
+    const outcome = await runAgent({
+      spec: made.spec,
+      agent,
+      input: made.input,
+      ctx: testContext({ signal: controller.signal }),
+    });
+    return { made, outcome };
+  })();
+  if (cancelled.outcome.kind !== 'failed' || cancelled.made.realModelCalls() > 0) {
+    v.push({
+      rule: 'cancellation',
+      detail:
+        `signal 已 abort 却仍然跑了 ${cancelled.made.realModelCalls()} 次真实模型调用。` +
+        `工作流被终止后继续烧 token 是最贵的一类 bug。`,
+    });
+  }
+
+  return v;
 }

@@ -1,5 +1,8 @@
 # ADR-0004：long-lease 与 yield 双租约策略
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> 异步化之后 `execute()` 毫秒级返回，worker 从不长时间持有任务，租约本身失去了意义。
+
 - 状态：**Revised by [ADR-0007](0007-lease-strategies-revised.md)**（2026-09-05）——核心假设被证伪
 - 日期：2026-09-05
 

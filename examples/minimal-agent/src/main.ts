@@ -32,18 +32,20 @@ async function main(): Promise<void> {
 
   const deadline = Date.now() + 120_000;
   let wf = await getWorkflow(workflowId);
+  const seen: string[] = [];
   while (Date.now() < deadline && (wf.status === 'RUNNING' || wf.status === undefined)) {
     await sleep(1_000);
     wf = await getWorkflow(workflowId);
     const t = wf.tasks?.[0];
-    if (t) process.stdout.write(`   task=${t.status ?? '?'}  `);
+    if (t?.status) seen.push(`${t.status}(poll=${t.pollCount ?? '?'})`);
   }
-  console.log();
+  console.log('   任务状态轨迹：', seen.join(' → ') || '（太快，没采到中间态）');
 
   console.log('④ 结果');
   console.log('   status  =', wf.status);
   console.log('   output  =', JSON.stringify(wf.output, null, 2));
   console.log(`   真实调用：模型 ${counters.modelCalls} 次 / 工具 ${counters.toolCalls} 次`);
+  console.log(`   （无论被 callback 几次，这两个数都只反映**一次**完整运行）`);
 
   const taskId = wf.tasks?.[0]?.taskId;
   if (taskId) {

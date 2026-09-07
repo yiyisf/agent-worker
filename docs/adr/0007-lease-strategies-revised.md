@@ -1,5 +1,8 @@
 # ADR-0007：三租约策略 —— lease-extend / callback / hybrid
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> 三种租约策略随分片模型一起删除。`extendLease` 的版本核实结论仍然成立，但不再被使用。
+
 - 状态：Accepted（Revises [ADR-0004](0004-lease-strategy.md)）
 - 日期：2026-09-05
 

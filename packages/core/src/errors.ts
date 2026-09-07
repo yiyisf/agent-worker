@@ -26,30 +26,25 @@ export class GuardrailBlockedError extends CaError {
 }
 
 /**
- * 模糊重放：journal 里只有 tool.intent 没有结果 —— 工具执行到一半进程没了，
- * 不知道副作用有没有生效（ADR-0005）。默认终局失败，把决策交给工作流的补偿分支。
+ * 单次模型调用或工具执行超时。可重试 —— 慢一次不代表这次运行没救。
+ *
+ * ⚠️ 字段叫 callName 而不是 name：`readonly name` 会覆盖 Error.name，
+ * 让错误在序列化后失去类型标识（被这条的单测抓到过）。
  */
-export class AmbiguousReplayError extends CaError {
+export class CallTimeoutError extends CaError {
   constructor(
-    readonly toolName: string,
-    readonly stepId: string,
+    readonly kind: 'model' | 'tool',
+    readonly callName: string,
+    readonly timeoutMs: number,
   ) {
-    super(
-      `tool "${toolName}" 上次执行结果未知（只有 intent 没有 result），` +
-        `按 onAmbiguousReplay=fail 终止；stepId=${stepId}`,
-      false,
-    );
+    super(`${kind} "${callName}" 超过 ${timeoutMs}ms 未返回`, true);
   }
 }
 
-/** 抢占失败或 fence 落后：立即放弃，不回写 Conductor（§5.3） */
-export class FencedOutError extends CaError {
-  constructor(
-    readonly runKey: string,
-    readonly ownFence: number,
-    readonly currentFence: number,
-  ) {
-    super(`run ${runKey} fenced out: own=${ownFence} current=${currentFence}`, true);
+/** 整次运行超过 limits.wallClockMs。终局 —— 再跑一次多半还是超 */
+export class RunTimeoutError extends CaError {
+  constructor(readonly wallClockMs: number) {
+    super(`agent 运行超过 wallClockMs=${wallClockMs}ms`, false);
   }
 }
 
@@ -58,4 +53,19 @@ export class CapabilityError extends CaError {
   constructor(message: string) {
     super(message, false);
   }
+}
+
+/** 可跨进程传输的错误快照 */
+export interface SerializedError {
+  name: string;
+  message: string;
+  retryable: boolean;
+}
+
+export function serializeError(err: unknown): SerializedError {
+  if (err instanceof CaError) {
+    return { name: err.name, message: err.message, retryable: err.retryable };
+  }
+  const e = err as Error;
+  return { name: e?.name ?? 'Error', message: e?.message ?? String(err), retryable: true };
 }

@@ -4,20 +4,21 @@
 工作流里放一个 task，背后就是一次完整的、可观测、可恢复、有预算约束的 Agent 运行。
 
 - **语言**：TypeScript (Node.js ≥ 20)
-- **执行模式**：Worker 内闭环 —— 一个 Conductor task = 一次完整 Agent 运行，循环跑在 **worker 进程内**
+- **执行模式**：**异步化** —— 一个 Conductor task = 一次完整 Agent 运行的**观察句柄**；
+  `execute()` 毫秒级返回，agent 在后台跑完后直接把任务推向终态（[ADR-0019](docs/adr/0019-async-agent-execution.md)）
 - **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
-- **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
-- **当前状态**：**M1 代码完成**（v0.6 设计）。88 个离线测试通过；端到端验证待真机执行，见 [docs/verification.md](docs/verification.md)
+- **对接方式**：`callback` 心跳（Conductor 3.x 全系可用），不用 `extendLease`、不做分片
+- **当前状态**：**M1 代码完成**（v0.7 设计）。73 个离线测试通过；端到端验证待真机执行，见 [docs/verification.md](docs/verification.md)
 
 ## 这个 SDK 做什么、不做什么
 
 ```
 外部 Agent SDK 负责          本 SDK 负责
 ─────────────────────       ─────────────────────
-推理循环 / 停止条件           Journal 与崩溃恢复
-上下文压缩 / 工具收窄          effectively-once（幂等 + Fencing）
-工具定义 DSL                 预算治理（token / cost / 时间）
-模型 provider 生态            Conductor 租约与分片执行
+推理循环 / 停止条件           异步执行与失联接管
+上下文压缩 / 工具收窄          预算治理（token / cost / 时间）
+工具定义 DSL                 超时闸门与工具幂等键
+模型 provider 生态            Conductor callback 协议
 MCP 客户端                   结果映射与 payload 治理
 结构化输出                   OTel GenAI 埋点与成本归集
 既有 harness 适配             配置化（AgentSpec）与领域定制
@@ -33,11 +34,12 @@ MCP 客户端                   结果映射与 payload 治理
 const model = wrapLanguageModel({          // AI SDK 中间件
   model: userModel,
   middleware: { wrapGenerate: ({ doGenerate, params }) =>
-    deps.model.guard(params, async () => { /* ... */ }) },
+    gateways.model.guard(params, async () => { /* ... */ }) },
 });
 const tools = mapValues(userTools, (t, name) => ({
   ...t,
-  execute: (input, opts) => deps.tools.guard(name, input, () => t.execute!(input, opts)),
+  execute: (input, opts) => gateways.tools.guard(name, input,
+    ({ idempotencyKey }) => t.execute!(input, { ...opts, idempotencyKey })),
 }));
 ```
 
@@ -61,7 +63,7 @@ const tools = mapValues(userTools, (t, name) => ({
 - `toolInterception`：harness 一律 `host-declared-only` —— 我们传进去的工具拦得到，
   它自带的内建工具拦不到，`effectful` 声明在内建工具上会被启动时拒绝。
 
-宣称"支持任意 SDK"却不说清能力边界，比不支持更危险 —— 用户会误以为拿到了 effectively-once。
+宣称"支持任意 SDK"却不说清能力边界，比不支持更危险 —— 用户会误以为拿到了调用级成本管控。
 
 ### 2. `AgentSpec` —— 纯 JSON 的配置化
 
@@ -71,9 +73,9 @@ const tools = mapValues(userTools, (t, name) => ({
   "extends": ["@acme/ca-pack-insurance#claimsTriageBase"],
   "engine": "ai-sdk/tool-loop",
   "engineOptions": { "model": "claude-sonnet-5", "stopWhen": { "isStepCount": 30 } },
-  "toolPolicies": { "openClaim": { "effect": "effectful", "onAmbiguousReplay": "probe" } },
+  "toolPolicies": { "openClaim": { "effect": "effectful", "timeoutMs": 120000 } },
   "limits": { "maxCostUsd": 2, "wallClockMs": 900000 },
-  "conductor": { "leaseStrategy": "callback", "domain": "insurance" }
+  "conductor": { "callbackAfterSeconds": 30, "domain": "insurance" }
 }
 ```
 
@@ -85,30 +87,43 @@ L0 通用默认 → L1 领域包（`@acme/ca-pack-<domain>`：工具、策略、
 → L2 实例 spec，逐层覆盖。合并结果输出 **effective spec 快照**写入 journal 与 `outputData`，
 使「这次运行到底用的什么配置」可追溯（[ADR-0013](docs/adr/0013-agent-spec-and-domain-packs.md)）。
 
-## Conductor 对接（v0.3 已对齐）
+## Conductor 对接
 
-| 能力 | 最低版本 |
-|---|---|
-| `callback` 策略（默认） | 3.x 全系 |
-| `lease-extend` / `hybrid` | **v3.10.7**（`TaskResult.extendLease` 自该版本引入） |
+`execute()` 只回答一个问题：**这个 taskId 的运行现在怎么样了？**
 
-服务端租约/超时的精确语义见 [architecture.md §2.2](docs/architecture.md#22-服务端语义v32121-源码核实结论)，
-三条容易踩的坑：`retryCount` 不可为 0、`timeoutSeconds` 必须覆盖所有等待时间、`timeoutPolicy` 对 responseTimeout 无效。
+```
+poll → execute(task)                    ← 毫秒级返回，从不阻塞
+         ├─ 没有这个运行 → 后台起一个 → IN_PROGRESS + callbackAfterSeconds
+         ├─ 正在跑       → IN_PROGRESS（带进展）
+         ├─ 已完成       → COMPLETED / FAILED
+         └─ 宿主失联     → 接管重跑（不消耗 Conductor 重试配额）
 
-**`EngineTurn` 与 Conductor 分片天然同构**：引擎交还一轮 = 桥接层交还一个分片。
-AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要任何 hack。
+后台运行结束 → 直接 updateTask(COMPLETED)，不等下一次 callback
+```
+
+**运行的身份就是 `taskId`**：同一次执行的多次 callback 共享它，重试则是新的
+（[ADR-0020](docs/adr/0020-runid-is-taskid.md)）。不需要自己拼恢复锚点。
+
+服务端语义见 [architecture.md §2.2](docs/architecture.md#22-服务端语义v32121-源码核实结论)，
+三条最容易踩的坑（都经 3.21.21 源码核实）：
+
+1. **队列有 60 秒 unack 窗口，硬编码不可配** —— worker 持有任务超过它，
+   消息会被放回队列被别人并发取走。这是 `execute()` 必须毫秒返回的硬理由。
+2. **`IN_PROGRESS` 回执会被存成 `SCHEDULED`**，所以等待期间 `responseTimeout` 根本不参与判定。
+3. **`inputData` 在一个 task 实例内是冻结的** —— 外部信号无法在 callback 等待期间送达。
 
 ## 从这里开始
 
 | 文档 | 内容 |
 |---|---|
 | [docs/architecture.md](docs/architecture.md) | 完整技术架构设计 |
-| [§3.1 核心洞察](docs/architecture.md#31-核心洞察可靠性不需要拥有循环) | 为什么 core 可以这么薄 |
+| [§3.1 两条核心洞察](docs/architecture.md#31-两条核心洞察) | 为什么 core 可以这么薄，以及为什么 agent 不该被塞进任务窗口 |
+| [§5 执行模型](docs/architecture.md#5-执行模型) | callback 协议、运行注册表、失联接管 |
 | [§4.4 能力边界](docs/architecture.md#44-enginecapabilities--诚实的能力边界) | 不同引擎的能力差异与校验 |
 | [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2、SpecLoader、引擎契约版本 |
 | [§10.4 进展反馈](docs/architecture.md#104-进展反馈让编排引擎在运行中就知道进度) | 运行中的进展同步回编排引擎（不是实时输出流） |
-| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条 |
-| [docs/adr/](docs/adr/) | 18 条决策记录（含 3 条被后续推翻、2 条被修订的） |
+| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 10 条、已定方案 3 条、仍开放 3 条 |
+| [docs/adr/](docs/adr/) | 21 条决策记录（v0.7 推翻了其中 7 条、修订 2 条 —— 每条都写清了推翻的理由） |
 | [docs/verification.md](docs/verification.md) | M1 端到端验证清单：命令、预期输出、通过标准 |
 
 ## 仓库结构
@@ -121,8 +136,8 @@ examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
 
 ## 路线图
 
-**M1** ✅ 代码完成（core + engine-ai-sdk + redis StateStore + Conductor 桥接 + 进展反馈 + 示例）
-→ **M2** 可靠性（fencing + 三类测试 + **引擎一致性套件**）
+**M1** ✅ 代码完成（core 异步执行内核 + 运行注册表 + engine-ai-sdk + Conductor callback 协议 + 进展反馈 + 示例）
+→ **M2** 可靠性加固（失联/并发注入 + 大输入取回 + 「要不要把 journal 加回来」的实测决策）
 → **M3** 多引擎（harness 能力降级 + custom + 能力校验）
 → **M4** 配置化与领域定制 → **M5** HITL 与生态 → **M6** 生产化
 
@@ -134,16 +149,16 @@ M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把�
 其生态（Query / Store / Router / Pacer）以前端为主，
 [Pacer 官方文档](https://tanstack.com/pacer/latest/docs/overview)亦说明目前主要面向客户端，
 不适合进 worker 运行时依赖。将来若需要**运行观测台 / 人工审批界面**，
-独立为 `@ca/console` 应用，通过 StreamSink 与 StateStore 读取，与 worker 运行时解耦。
+独立为 `@ca/console` 应用，通过 StreamSink 与运行注册表读取，与 worker 运行时解耦。
 
 ## 本地开发
 
 ```bash
 pnpm install
 pnpm build          # 包之间按拓扑顺序构建；子包 typecheck 依赖 core 的构建产物
-pnpm test           # 91 个测试（无 Redis / Conductor 时自动跳过需要它们的用例）
+pnpm test           # 76 个测试（无 Redis / Conductor 时自动跳过需要它们的用例）
 
-# 需要 Redis 的用例（StateStore 契约、Worker 执行、进展端到端）
+# 需要 Redis 的用例（注册表一致性套件、端到端）
 # 没有 Redis 时会**跳过而不是失败** —— 纯逻辑部分任何机器上都能跑
 redis-server --port 6380 --daemonize yes --save '' --appendonly no
 pnpm test

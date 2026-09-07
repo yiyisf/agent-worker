@@ -3,14 +3,14 @@
  *
  * 合并顺序 L0 → L1（按 extends 顺序）→ L2，后者覆盖前者；
  * 数组字段的合并策略显式声明（guardrails 追加、toolPolicies 按键覆盖）。
- * 合并结果输出 EffectiveSpec 快照，写入 journal 与 outputData —— 配置化系统的生命线。
+ * 合并结果输出 EffectiveSpec 快照，随结果写入 outputData —— 配置化系统的生命线。
  */
 import type { AgentSpec, EffectiveSpec, ToolPolicy } from './spec.js';
 import type { Guardrail } from './guardrail.js';
 
 /**
  * 领域包（L1）。可贡献：工具、工具策略、护栏、prompt、spec 片段、eval 数据集、领域 schema。
- * **不可**贡献：受管入口的实现、Journal / Fence 语义、Conductor 映射 —— 那些是 core 的不变量。
+ * **不可**贡献：受管入口的实现、运行注册表语义、Conductor 映射 —— 那些是 core 的不变量。
  *
  * ⚠️ Pack 与引擎适配器同进程运行、具备完整权限，应按依赖审计对待（§9）。
  */

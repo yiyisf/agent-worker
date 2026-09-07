@@ -3,7 +3,7 @@
  * 面向使用者的完整测试设施（引擎一致性套件等）在 @ca/testing。
  */
 import type { AgentSpec, JsonValue } from './spec.js';
-import type { BuiltAgent, EngineRunArgs, EngineTurn, RunGateways } from './engine.js';
+import type { BuiltAgent, EngineRunArgs, RunGateways } from './engine.js';
 import type { AgentEvent } from './events.js';
 import type { RunContext } from './context.js';
 
@@ -14,16 +14,13 @@ export const silentLogger = {
   error() {},
 };
 
-export function makeContext(over: Partial<RunContext> = {}): RunContext & { events: AgentEvent[] } {
-  const events: AgentEvent[] = [];
-  const now = Date.now();
-  const ctx = {
-    runKey: 'wf-1:agent_ref:0',
-    runId: 'run-1',
+export function testContext(over: Partial<RunContext> = {}): RunContext {
+  const startedAt = Date.now();
+  return {
+    runId: 'task-1',
     attempt: 0,
-    sliceIndex: 0,
-    startedAt: now,
-    deadline: now + 300_000,
+    startedAt,
+    deadline: startedAt + 60_000,
     signal: new AbortController().signal,
     logger: silentLogger,
     budget: {
@@ -34,31 +31,26 @@ export function makeContext(over: Partial<RunContext> = {}): RunContext & { even
       remaining: () => Infinity,
     },
     secrets: { get: async () => undefined },
-    emit(e: AgentEvent) {
-      events.push(e);
-    },
-    events,
+    emit: (_e: AgentEvent) => {},
     ...over,
-  } as RunContext & { events: AgentEvent[] };
-  return ctx;
+  };
 }
 
-/** 用一个脚本化的「循环」冒充引擎：每一步都必须经过受管入口，正如真实引擎的义务 */
 export type ScriptStep =
   | { call: 'model'; payload: JsonValue; response: JsonValue; usage?: { inputTokens: number; outputTokens: number; costUsd?: number } }
-  | { call: 'tool'; name: string; input: JsonValue; run: (opts: { idempotencyKey: string }) => Promise<JsonValue> };
+  | { call: 'tool'; name: string; input: JsonValue; run: (o: { idempotencyKey: string }) => Promise<JsonValue> };
 
 export interface ScriptedAgentOptions {
   steps: ScriptStep[];
-  /** 跑完 steps 后的收尾动作，默认 done */
-  finish?: (state: JsonValue) => EngineTurn<JsonValue>;
-  /** 记录实际发生的真实调用（未被 journal 短路的），用于断言"没有重复付费/重复副作用" */
+  /** 跑完 steps 后的收尾，默认把每步的返回值汇总成数组 */
+  finish?: (outputs: JsonValue[]) => JsonValue;
+  /** 记录实际发生的真实调用，用于断言「跑了几次」 */
   sideEffects?: string[];
 }
 
-export function scriptedAgent(opts: ScriptedAgentOptions): BuiltAgent<JsonValue> {
+export function scriptedAgent(opts: ScriptedAgentOptions): BuiltAgent {
   return {
-    async run(args: EngineRunArgs<JsonValue>): Promise<EngineTurn<JsonValue>> {
+    async run(args: EngineRunArgs): Promise<JsonValue> {
       const { model, tools }: RunGateways = args.gateways;
       const outputs: JsonValue[] = [];
       for (const step of opts.steps) {
@@ -79,7 +71,7 @@ export function scriptedAgent(opts: ScriptedAgentOptions): BuiltAgent<JsonValue>
           outputs.push(r);
         }
       }
-      return opts.finish ? opts.finish(outputs) : { kind: 'done', output: outputs };
+      return opts.finish ? opts.finish(outputs) : outputs;
     },
   };
 }

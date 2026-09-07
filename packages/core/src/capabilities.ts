@@ -42,7 +42,7 @@ export function assertCapabilities(
   // ── 成本可见性 ──
   if (caps.costVisibility === 'none') {
     throw new CapabilityError(
-      `引擎 costVisibility='none'：完全看不见成本，journal 与预算都形同虚设，拒绝启动。`,
+      `引擎 costVisibility='none'：完全看不见成本，预算闸门形同虚设，拒绝启动。`,
     );
   }
   if (caps.costVisibility === 'per-turn') {
@@ -85,29 +85,10 @@ export function assertCapabilities(
     );
   }
 
-  // ── 恢复与分片 ──
-  if (caps.state === 'engine-session') {
-    warnings.push(
-      `引擎 state='engine-session'：避免重复付费由引擎自己的 session resume 负责，` +
-        `我们的 journal 只负责持久化它。`,
-    );
-  }
-  if (caps.sliceControl === 'none') {
-    warnings.push(
-      `引擎 sliceControl='none'：一轮 = 一分片，分片时长由引擎决定。` +
-        `请确保 limits.wallClockMs 按最坏情况的单轮时长设置（§15.3 第 1 条）。`,
-    );
-  }
   if (caps.progress === 'none') {
-    warnings.push(`引擎 progress='none'：进展只能在分片边界上报。`);
-  }
-
-  // ── 租约与恢复策略的自洽 ──
-  const lease = spec.conductor?.leaseStrategy ?? 'callback';
-  const resume = spec.conductor?.resumePolicy ?? 'on-lease-loss';
-  if (lease !== 'lease-extend' && resume === 'never') {
-    throw new CapabilityError(
-      `leaseStrategy='${lease}' 需要跨分片持久化状态，与 resumePolicy='never'（不落 journal）矛盾，拒绝启动。`,
+    warnings.push(
+      `引擎 progress='none'：拿不到步级进展，心跳只能靠固定节拍。` +
+        `失联判定会变迟钝，建议把 conductor.orphanAfterMs 设得宽一些。`,
     );
   }
 

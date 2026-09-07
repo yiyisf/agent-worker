@@ -1,9 +1,9 @@
 /**
- * @ca/memory —— StateStore / BlobStore 的持久化实现。见 docs/architecture.md §8。
+ * @ca/memory —— 运行注册表 / BlobStore 的持久化实现。见 docs/architecture.md §8。
  *
- * 默认的 callback 分片策略要求持久化 StateStore；@ca/core 里的内存实现只供本地开发，
- * createAgentWorker 会在启动时拒绝它。
+ * 多实例部署**必须**用这里的 RedisRunRegistry：@ca/core 的内存实现只在单进程内有效，
+ * 而 Conductor 不保证 callback 回到同一个 worker。
  *
- * 待实现（M2+）：postgres StateStore、s3 BlobStore、MemoryStore（跨 run 长期记忆）
+ * 待实现（M2+）：postgres 注册表、s3 BlobStore、MemoryStore（跨 run 长期记忆）
  */
 export * from './redis.js';
