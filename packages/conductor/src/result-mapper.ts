@@ -1,7 +1,7 @@
 /**
  * 运行状态 → Conductor 任务状态的映射，见 docs/architecture.md §6.2。
  *
- * 三态而已（ADR-0019 之后不再有分片交还与挂起交还）：
+ * 只有两种结局（extendLease 下任务从不中途交还，ADR-0022）：
  *   运行中   → IN_PROGRESS + callbackAfterSeconds（心跳）
  *   跑完了   → COMPLETED
  *   失败了   → 可重试走 FAILED（由 TaskDef.retryCount 决定），终局走 NonRetryableException

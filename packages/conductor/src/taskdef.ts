@@ -7,20 +7,26 @@
  *
  * 取值理由（均据 3.21.21 源码核实，见 §2.2）：
  *
+ * responseTimeoutSeconds = 60
+ *   extendLease 模式下这个值是**崩溃检测灵敏度**，不是运行时长上限：
+ *   worker 活着就一直有心跳（官方 LeaseTracker 按它 ×0.8 发），任务想跑多久跑多久；
+ *   worker 挂了就没人心跳，decider 在这个时长后判 TIMED_OUT、消耗一次 retryCount、
+ *   生成新 taskId 重新分配。60 秒 → 心跳每 48 秒一次，崩溃约 60~90 秒被发现。
+ *   ⚠️ 不能设太小（< 1.25 秒官方直接跳过心跳），也不宜太小 ——
+ *   该值同时决定 Conductor 重扫这个工作流的频率（WorkflowSweeper.unack = 它 + 1 秒）。
+ *
  * timeoutSeconds = 0
  *   `checkTaskTimeout` 首行即 `if (… || taskDef.getTimeoutSeconds() <= 0 || …) return;`。
- *   长时间运行的 agent 不设总时长上限，跑飞由 worker 自己的 limits.wallClockMs 兜底。
+ *   长时间运行的 agent 不设总时长上限，跑飞由 worker 自己的 limits.wallClockMs 兜底
+ *   （超了 execute() 会以终局错误返回，不必等引擎判超时）。
  *   需要硬 SLA 上限的部署可用 conductor.taskTimeoutSeconds 显式指定。
  *
- * responseTimeoutSeconds = 3600（服务端默认值）
- *   异步化之后 execute() 毫秒级返回，worker 从不长时间持有任务，这个值几乎用不上。
- *   刻意**不调小**：调小会让 decider 抢在队列 unack 之前把任务判 TIMED_OUT 并消耗一次
- *   retryCount（换新 taskId），而队列 unack 走的是同 taskId 重投，更便宜也更符合语义。
- *
  * retryCount = 3
- *   留给真正的业务失败。孤儿运行的重启不走这条路（ADR-0021），不消耗它。
+ *   extendLease 模式下这个配额是**真的会被 worker 崩溃消耗**的，不可为 0。
  */
+import { DEFAULT_RESPONSE_TIMEOUT_SECONDS } from '@ca/core';
 import type { AgentSpec } from '@ca/core';
+import { assertHeartbeatViable } from './lease.js';
 
 /** 结构对齐官方 SDK 的 TaskDef，注册时交给官方 MetadataClient */
 export interface DerivedTaskDef {
@@ -36,22 +42,24 @@ export interface DerivedTaskDef {
   rateLimitFrequencyInSeconds?: number;
 }
 
-/** Conductor 服务端 TaskDef.responseTimeoutSeconds 的默认值（ONE_HOUR） */
-export const SERVER_DEFAULT_RESPONSE_TIMEOUT_SECONDS = 3600;
-
 export function taskTypeOf(spec: AgentSpec): string {
   return spec.conductor?.taskType ?? `agent_${spec.name}`;
 }
 
+export function responseTimeoutOf(spec: AgentSpec): number {
+  return spec.conductor?.responseTimeoutSeconds ?? DEFAULT_RESPONSE_TIMEOUT_SECONDS;
+}
+
 export function deriveTaskDef(spec: AgentSpec): DerivedTaskDef {
-  const override = (spec.conductor as { taskTimeoutSeconds?: number } | undefined)?.taskTimeoutSeconds;
+  const responseTimeoutSeconds = responseTimeoutOf(spec);
+  assertHeartbeatViable(responseTimeoutSeconds);
   return {
     name: taskTypeOf(spec),
     retryCount: 3,
     retryLogic: 'EXPONENTIAL_BACKOFF',
     retryDelaySeconds: 5,
-    timeoutSeconds: override ?? 0,
-    responseTimeoutSeconds: SERVER_DEFAULT_RESPONSE_TIMEOUT_SECONDS,
+    timeoutSeconds: spec.conductor?.taskTimeoutSeconds ?? 0,
+    responseTimeoutSeconds,
     timeoutPolicy: 'RETRY',
   };
 }
@@ -73,7 +81,10 @@ const COMPARED: (keyof DerivedTaskDef)[] = [
 
 /**
  * 启动时校验线上 TaskDef 与本地定义是否漂移；默认告警不阻塞。
- * 这是**运维视角**的检查，不是 worker 运行期依赖 —— 漂移了也不影响 execute() 的行为。
+ *
+ * ⚠️ extendLease 模式下 `responseTimeoutSeconds` 的漂移**是要紧的**：
+ * 官方 LeaseTracker 读的是**运行态任务上的快照值**（调度那一刻从线上 TaskDef 复制），
+ * 线上被调小到 1.25 秒以下会让心跳被静默跳过。所以这条漂移应当当成告警看待。
  */
 export function diffTaskDefs(
   local: readonly DerivedTaskDef[],

@@ -1,21 +1,20 @@
 /**
- * 把进展写回 Conductor，见 docs/architecture.md §10.4 与 ADR-0018。
+ * 把进展写回 Conductor，见 docs/architecture.md §10.4 与 ADR-0018 / ADR-0022。
  *
- * 两条通道，可靠性分级：
+ * ⚠️ extendLease 模式下两条通道的角色是这样的：
  *
- *   通道一 outputData.progress（**权威**）
- *     每次 callback 交还本身就是一次 task update，顺手把最新 ProgressReport 写进 outputData，
- *     零额外请求。这是唯一能被工作流消费的通道 —— 其他 task 可读
- *     ${agent_ref.output.progress.step} 做 SWITCH 分支、超时告警或通知。
- *     由 task-io 负责，不在本文件。
+ *   通道一 outputData.progress（权威，但**只在终态**）
+ *     任务结束时随结果写一次，零额外请求。工作流可以事后读
+ *     ${agent_ref.output.progress} 与 .usage 做分支或成本归集。由 task-io 负责，不在本文件。
+ *     运行**中**读不到 —— extendLease 心跳在写 outputData 之前就 return 了，
+ *     而正常的 updateTask(IN_PROGRESS) 会把任务写回队列、破坏 worker 亲和。
  *
- *   通道二 Conductor Task Log（**尽力而为**）
- *     经官方 SDK 的 getTaskContext()?.addLog()，优点是运行**中途**也能写，不必等 callback；
- *     由后台宿主在每次心跳时顺带推出去。但受三条服务端约束（v3.21.21 源码核实），
- *     只当作 UI 上的镜像，丢了不算故障。
+ *   通道二 Conductor Task Log（**运行中唯一可见**，尽力而为）
+ *     经官方 SDK 的 TaskClient.addTaskLog —— 它**不碰队列**，所以运行途中随时可写。
+ *     由 worker 的周期任务批量推出去。但受三条服务端约束（v3.21.21 源码核实），
+ *     部署没启用索引时会被静默丢弃，所以是尽力而为的。
  *
- * 异步化之后进展还兼任**心跳**：每产生一次进展就刷新一次注册表的 updatedAt，
- * 失联判定（ADR-0021）建立在这上面。
+ * 心跳与本模块无关 —— 那是官方 LeaseTracker 的事。
  */
 import { createThrottledReporter, type ProgressOptions, type ProgressReport, type ProgressReporter } from '@ca/core';
 import type { Logger } from '@ca/core';

@@ -1,13 +1,15 @@
 /**
  * @ca/conductor —— 官方 SDK 之上的薄桥接层（ADR-0006）。
  *
- * 不实现：鉴权、poll 循环、并发、TaskContext、worker 指标 —— 全部来自
- * `@io-orkes/conductor-javascript`（peerDependency）。
+ * 不实现：鉴权、poll 循环、并发、**租约心跳**、TaskContext、worker 指标 —— 全部来自
+ * `@io-orkes/conductor-javascript`（peerDependency）。心跳由官方 LeaseTracker 托管，
+ * 我们只负责把 leaseExtendEnabled 打开并校验取值（ADR-0022）。
  *
  * 只实现：AgentSpec → ConductorWorker 的编译、运行态输入/输出的取用、
  * 结果映射与 payload 外置、取消检测、TaskDef 推导（注册期）。
  */
 export * from './types.js';
+export * from './lease.js';
 export * from './taskdef.js';
 export * from './task-io.js';
 export * from './result-mapper.js';

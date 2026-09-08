@@ -1,7 +1,9 @@
 # ADR-0004：long-lease 与 yield 双租约策略
 
-> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
-> 异步化之后 `execute()` 毫秒级返回，worker 从不长时间持有任务，租约本身失去了意义。
+> ℹ️ **本 ADR 的结论在 [ADR-0022](0022-lease-extend-worker-affinity.md)（v0.8）中被重新采纳。**
+> v0.7 曾把它标为 Superseded，那是基于「callback 能保证同一 worker」的错误认知。
+> 复核后：**extendLease 才是保证「一次执行始终在同一 worker」的模式**，本 SDK 用它。
+> 具体取值与心跳实现（交给官方 LeaseTracker）见 ADR-0022。
 
 - 状态：**Revised by [ADR-0007](0007-lease-strategies-revised.md)**（2026-09-05）——核心假设被证伪
 - 日期：2026-09-05

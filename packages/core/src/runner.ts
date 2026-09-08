@@ -2,7 +2,7 @@
  * 运行驱动器：装好受管入口，让引擎从头跑到完成。见 docs/architecture.md §5.1 与 ADR-0012/0019。
  *
  * core 不拥有循环 —— 这里只负责「装好受管入口、预算、超时，把结果收回来」。
- * 没有分片，所以也没有状态交接：agent 的状态自始至终在这一次调用的内存里。
+ * agent 的状态自始至终在这一次调用的内存里 —— extendLease 保证它不会中途换 worker（ADR-0022）。
  */
 import type { AgentSpec, JsonValue } from './spec.js';
 import type { BuiltAgent, RunBudget } from './engine.js';
@@ -44,7 +44,7 @@ export function deriveRunBudget(spec: AgentSpec, override?: Partial<RunBudget>):
 }
 
 /**
- * 跑完一次 agent。返回的 RunOutcome 由桥接层写进注册表，再翻译成 Conductor 的任务状态（§6.2）。
+ * 跑完一次 agent。返回的 RunOutcome 由桥接层翻译成 Conductor 的任务状态（§6.2）。
  *
  * 只有一种失败：抛异常。`CaError.retryable` 决定它是「交给引擎重试」还是「终局失败」。
  */

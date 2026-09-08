@@ -1,31 +1,41 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
-> 状态：Draft v0.7 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
+> 状态：Draft v0.8 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.10.7
 > 上游基线（实装核实）：**`ai@7.0.93`**、**`@io-orkes/conductor-javascript@4.0.0`**
 >
-> ## v0.7：执行模型换了
+> ## v0.8：改用 extendLease 心跳，并更正一条事实
 >
-> v0.6 及以前把 agent **切片塞进 Conductor 任务的执行窗口**里跑：一次 `execute()` 跑一个分片，
-> 跑不完就带着状态交还，下次 callback 再续。这个模型带来了一长串本不必要的机制 ——
-> 跨分片状态持久化、journal 重放、租约与 fencing、交还预算校验。
+> v0.7 的执行模型建立在一条**错误的核实结论**上：
 >
-> v0.7 改成 **agent 与编排任务解耦**（[ADR-0019](adr/0019-async-agent-execution.md)）：
+> > 「队列有 60 秒 unack 窗口，worker 持有任务超过它会被另一个 worker 并发取走。」
 >
-> - `execute()` **毫秒级返回**，只回答「这个 taskId 的运行现在怎么样了」
-> - agent 在**后台**从头跑到完成，状态全程在这一次运行的内存里
-> - 运行结束时**直接** `updateTask` 把任务推向终态，不等下一次 callback
-> - callback 退化成**心跳检查**：只用来发现后台运行的宿主是不是没了
+> 复核后这是错的。`ExecutionService.poll` 的最后一行是
+> `tasks.forEach(this::ackTaskReceived)` → `queueDAO.ack` → `DELETE FROM queue_message`
+> —— **poll 成功之后任务已经从队列里删掉了**，那个窗口只覆盖 `pop` 到 `ack` 之间的
+> 毫秒级间隙，不是 worker 持有任务时长的红线。
 >
-> 由此**删除**：分片（`sliceMs` / `SliceBudget` / `stopWhen` 预算）、跨分片状态恢复、
-> journal 与重放、租约与 fencing token、交还预算校验、`resumePolicy` / `leaseStrategy`。
-> **新增**：运行注册表（`RunRegistry`）与后台运行宿主（`AgentRunHost`），
-> 以及「同一次执行的多次 callback vs 不同任务」的身份判据 ——
-> 就是 Conductor 的 **taskId**（[ADR-0020](adr/0020-runid-is-taskid.md)）。
+> 真正的差别在两种模式之间：
 >
-> 同时纠正了四条 v0.6 的服务端语义偏差，见 §2.2。
+> | | callback | **extendLease** |
+> |---|---|---|
+> | 每次交还 | `postpone` **写回队列** | 不交还 |
+> | 下一次谁执行 | 队列里谁先 `pop` 谁得 → **任意 worker** | **只能是当前这个** |
+> | worker 崩了 | 队列消息到点被别人取走 | `responseTimeout` → `TIMED_OUT` → 消耗一次 retry → 新 taskId |
 >
-> **实装状态**：`@ca/core` / `@ca/engine-ai-sdk` / `@ca/memory` / `@ca/conductor` / `@ca/testing`
-> 已按 v0.7 重写，**76 个测试**（73 通过 + 3 个端到端待真机）。
+> 于是 v0.8 改用 **extendLease**（[ADR-0022](adr/0022-lease-extend-worker-affinity.md)）：
+>
+> - `execute()` 就是**把 agent 从头跑到完**，跑多久都行
+> - **心跳不自己实现** —— 官方 SDK 的 `LeaseTracker` 按 `responseTimeoutSeconds × 0.8`
+>   自动发 `extendLease`，我们只打开 `leaseExtendEnabled: true` 并校验取值
+> - **「一次执行始终在同一 worker」是引擎保证的**，失败重试才重新分配
+>
+> 由此删除 v0.7 引入的：`AgentRunHost`、`RunRegistry`（内存与 Redis）、callback 协议、
+> 所有权与心跳自实现、孤儿处置。**SDK 默认零外部依赖。**
+>
+> v0.7 保留的结论：一次运行从头跑到完成、不切片；删除 journal / 跨分片状态 / fencing；
+> 运行标识就是 `taskId`；TaskDef 是只写不读的注册期契约。
+>
+> **实装状态**：**57 个测试**（54 通过 + 3 个端到端待真机）。
 > 端到端验证清单见 [verification.md](verification.md)。
 
 ---
@@ -41,14 +51,14 @@
    模型 provider 生态——全部由外部 Agent SDK 提供（Vercel AI SDK 为首选参考实现），
    本 SDK 通过 `AgentEngine` 适配它们。
 2. **薄 core**。`@ca/core` 只有四件事：`AgentSpec` 契约、`AgentEngine` 契约、
-   两个受管入口（模型 / 工具）、执行内核（后台运行宿主 / 运行注册表 / 预算 / 超时）。
+   两个受管入口（模型 / 工具）、执行内核（runAgent / 预算 / 超时 / 能力校验）。
 3. **通用配置化 + 领域定制**。`AgentSpec` 是纯数据，可来自 TS / JSON / YAML / 远程配置；
    L0 通用默认 → L1 领域包（Domain Pack）→ L2 实例，逐层覆盖。
 4. **可靠性与引擎解耦**。任何引擎只要能让我们包住模型与工具两个入口，
    就自动获得崩溃恢复、effectively-once、预算治理、OTel 埋点。
 5. **诚实的能力边界**。不同引擎能力不同（如 sandbox 内执行的 harness 拦截不到工具），
    用 `EngineCapabilities` 显式建模并在启动时校验，不假装统一（§4.4）。
-6. **Conductor 对接**：异步化执行 + callback 心跳协议 + 运行注册表（§5、§6）。
+6. **Conductor 对接**：extendLease 心跳（官方 LeaseTracker 托管）+ 运行态 I/O（§5、§6）。
 
 ### 1.2 非目标
 
@@ -75,9 +85,9 @@
 
 | # | Conductor 的语义 | Agent 的现实 | 对策 |
 |---|---|---|---|
-| C1 | 任务被 worker 持有期间受 `responseTimeoutSeconds` 约束；队列还有 **60 秒 unack 窗口** | 一次运行可能数十分钟 | §5 异步化：`execute()` 毫秒返回，agent 在后台跑 |
-| C2 | **at-least-once** 投递 | LLM 花钱、工具有副作用 | §5.3 运行注册表的原子占位；工具幂等键 |
-| C3 | 无取消推送 | Agent 还在烧 token | §6.4 CancellationWatcher，经心跳传导到 `ctx.signal` |
+| C1 | worker 持有任务期间 `responseTimeoutSeconds` 内无更新即判死 | 一次运行可能数十分钟 | §5 **extendLease 心跳**，由官方 `LeaseTracker` 托管 |
+| C2 | **at-least-once** 投递 | LLM 花钱、工具有副作用 | extendLease 保证同一执行不被并发领取；工具幂等键 |
+| C3 | 无取消推送 | Agent 还在烧 token | §6.4 CancellationWatcher → `ctx.signal` |
 | C4 | payload 有体积上限（3072 KB 外置 / 10240 KB 失败） | transcript 几 MB | §6.3 Payload 外置 |
 | C5 | 无流式通道 | 要看 token 流 | §10.3 旁路 StreamSink |
 | C6 | 重试由 `retryCount` 决定 | 有的失败重跑无意义 | §6.2 错误分类：终局错误走 `NonRetryableException` |
@@ -85,73 +95,68 @@
 
 ### 2.2 服务端语义（v3.21.21 源码核实结论）
 
-以下每一条都读过源码。**加粗的四条是 v0.7 对 v0.6 的纠正**，它们直接改变了配置取值。
+以下每一条都读过源码。
 
-**任务生命周期**
+#### 任务生命周期（extendLease 模式）
 
 | 阶段 | 服务端行为 |
 |---|---|
-| 调度 | `SimpleTaskMapper` 建 `TaskModel(SCHEDULED)`，入队 `taskType[:domain][@ns][-isolation]` |
-| poll | `queueDAO.pop` → 状态置 `IN_PROGRESS`、**`callbackAfterSeconds` 重置为 0**、`startTime`（仅首次）、`pollCount++` |
-| 交还 `IN_PROGRESS` | **状态实际存为 `SCHEDULED`**；`outputData` **整体覆盖**；`queueDAO.postpone` 重置 `deliver_on` |
-| 等待期 | 状态是 `SCHEDULED` → `isResponseTimedOut` 不判定（它要求 `IN_PROGRESS`）→ 可以等任意久 |
-| 再次 poll | **同一 taskId**；`inputData` 冻结；`outputData` 是上次写的；`startTime` / `retryCount` 不变 |
-| 终态回执 | `queueDAO.remove` → callback 循环**立即停止** |
+| 调度 | `SimpleTaskMapper` 建 `TaskModel(SCHEDULED)`，入队 `taskType[:domain][@ns][-isolation]`；`responseTimeoutSeconds` 从 TaskDef 快照到任务上 |
+| **poll** | `queueDAO.pop` → 状态 `IN_PROGRESS`、`startTime`（仅首次）、`pollCount++`、`setWorkerId` → **最后 `ackTaskReceived` → `queueDAO.ack` → `DELETE FROM queue_message`** |
+| **持有期** | **任务已不在队列里**，别的 worker 看不到它。唯一约束是 `responseTimeoutSeconds` 内要有更新 |
+| **心跳** | `updateTask({extendLease:true})` → `if (isExtendLease) { extendLease(); return null; }` → 只 `setUpdateTime`，**不碰队列、也碰不到 `outputData`** |
+| 终态回执 | 写 `outputData`、`queueDAO.remove`（幂等，已删过也无妨） |
+| worker 崩了 | 无人心跳 → `isResponseTimedOut` → `timeoutTask()` → `TIMED_OUT` → **消耗一次 `retryCount`** |
 | 重试 | **新 taskId**；`task.copy()` **原样携带上次 `outputData`**；`inputData` 重新求值；`startTime=0`；`retryCount+1` |
 
-**四条纠正**
+**「一次执行始终在同一 worker，失败重试才重新分配」是引擎保证的**，不需要 SDK 做任何事。
 
-1. ⚠️ **队列有 60 秒 unack 窗口，两个后端都写死、不可配。**
-   ```sql
-   -- PostgresQueueDAO.processUnacks，每 60 秒跑一次（UNACK_SCHEDULE_MS = 60_000L）
-   UPDATE queue_message SET popped = false
-   WHERE popped = true AND (current_timestamp - interval '60 seconds') > deliver_on
-   ```
-   Redis/dyno-queues 同样：`new RedisQueues(..., 60_000, 60_000, ...)`。
-   **worker 持有任务超过约 60 秒不回执，消息会被放回队列、被另一个 worker 并发取走。**
-   这是 `execute()` 必须毫秒级返回的硬理由 —— 也是 v0.6 的分片模型贴着红线跑而不自知的地方。
+#### ⚠️ v0.8 更正：60 秒 unack 窗口不是持有时长的红线
 
-2. **`IN_PROGRESS` 回执会被存成 `SCHEDULED`**（`WorkflowExecutorOps.updateTask`：
-   `if (!isSystemTask && status == IN_PROGRESS) task.setStatus(SCHEDULED)`）。
-   连带推论：等待期间 `responseTimeout` **根本不参与判定**；而 poll 时
-   `setCallbackAfterSeconds(0)`，所以 v0.6 反复引用的
-   `adjustedResponseTimeout = responseTimeout + callbackAfterSeconds`
-   **对 SIMPLE worker 任务是条死代码**。
+v0.7 把下面这段当成 worker 不能长时间持有任务的证据：
 
-3. **`timeoutSeconds` 每次 attempt 重新起算**，且要扣 `startDelayInSeconds`：
-   `elapsedTime = now - (startTime + startDelayInSeconds × 1000)`，而 `retry()` 会
-   `setStartTime(0)`，`startTime` 只在本次 attempt 首次 poll 时设置。
-   另外 `checkTaskTimeout` 首行即 `if (… || taskDef.getTimeoutSeconds() <= 0 || …) return;`
-   —— **`timeoutSeconds = 0` 时任务永不因总时长超时**，这是长任务的正确配置（§6.6）。
+```sql
+-- PostgresQueueDAO.processUnacks，每 60 秒跑一次（UNACK_SCHEDULE_MS = 60_000L）
+UPDATE queue_message SET popped = false
+WHERE popped = true AND (current_timestamp - interval '60 seconds') > deliver_on
+```
 
-4. **`outputData` 是整体覆盖，不是合并**（`task.setOutputData(taskResult.getOutputData())`）。
-   分片间无法靠增量写入累积；每次回执都必须是完整快照。
+**这条推论是错的。** `poll` 在返回前就 `ack` 掉了消息（`DELETE FROM queue_message`），
+所以「`popped = true` 且超期」这个条件只可能命中 `pop` 到 `ack` 之间的**毫秒级**间隙。
+任务被 worker 持有期间根本不在 `queue_message` 表里。
 
-**其余已核实结论**
+#### callback 与 extendLease 的真实差别
 
-- `responseTimeout` 超时 = `setStatus(TIMED_OUT)` 并消耗一次 `retryCount`，直接调 `timeoutTask()`
-  **绕过 `timeoutPolicy`**。因此 `retryCount` 不可为 0，且 `responseTimeoutSeconds`
-  **不该调小** —— 调小会抢在队列 unack 之前把一次廉价的同 taskId 重投变成一次昂贵的重试。
-- `callbackAfterSeconds` **没有服务端上限**：`ExecutionService.requeue()` 只做下限钳制。
-- `WorkflowSweeper.unack()` 把 decider 队列的 unack 设为 `responseTimeoutSeconds + 1`
-  （上限 `maxPostponeDurationSeconds`，默认 3600s）—— 该值同时决定工作流的重扫频率。
-- `updateTask` **没有**「必须是 poll 到它的那个 worker」的校验，且 `SCHEDULED` 不是终态。
-  **任何持有 taskId 的进程都能把任务推向终态** —— §5.2 的主动回执正是基于这一点。
+| | callback | **extendLease（本 SDK 用）** |
+|---|---|---|
+| 每次交还 | `updateTask(IN_PROGRESS)` → 状态存为 `SCHEDULED` + `postpone` **写回队列** | 不交还 |
+| 下一次谁执行 | 队列里谁先 `pop` 谁得 → **任意 worker** | **只能是当前这个** |
+| 能否更新 `outputData` | 能（每次交还都写） | **不能**（`extendLease` 分支提前 return） |
+| 最低服务端版本 | 3.x 全系 | **3.10.7**（`TaskResult.extendLease` 引入） |
+
+#### 其余已核实结论
+
 - **没有 worker 亲和机制。** 队列名只由 `taskType[:domain][@ns][-isolation]` 构成，
-  `workerId` 只用于日志、`setWorkerId` 记录与 `updateTaskLastPoll` 指标；
-  全库 grep `sticky|affinit|preferredWorker` 无任何结果。
-  SDK 用的 `POST /api/tasks/update-v2` 是「更新完顺手替这个 worker poll 一次同队列」的
-  **链式优化**，返回队首任务，不保证是刚交还的那个。
-  → **多实例部署必须用共享的运行注册表**（§5.3）。
+  `workerId` 全库只用于日志、`setWorkerId` 记录、`updateTaskLastPoll` 指标。
+  亲和来自「任务不在队列里」，不是来自路由。
+- `responseTimeout` 超时直接调 `timeoutTask()`，**绕过 `timeoutPolicy`**（`ALERT_ONLY` 对它无效）。
+  因此 `retryCount` **不可为 0**。
+- `checkTaskTimeout` 首行即 `if (… || taskDef.getTimeoutSeconds() <= 0 || …) return;`
+  —— **`timeoutSeconds = 0` 时任务永不因总时长超时**，这是长任务的正确配置（§6.6）。
+  它还会扣掉 `startDelayInSeconds`，且 `retry()` 会 `setStartTime(0)` → **每次 attempt 重新起算**。
+- `WorkflowSweeper.unack()` 把 decider 队列的 unack 设为 `responseTimeoutSeconds + 1`
+  —— 该值同时决定工作流的重扫频率，所以不宜设得过小。
+- **`outputData` 是整体覆盖，不是合并**（`task.setOutputData(taskResult.getOutputData())`）。
+- 官方 `LeaseTracker`：`intervalMs = task.responseTimeoutSeconds × 0.8 × 1000`，
+  **`intervalMs < 1000` 时静默跳过不发心跳**（对应 `responseTimeoutSeconds < 1.25`），
+  跑在独立的 100ms 定时器上，并发槽占满也照常心跳。
 - `TaskDef` 的 `inputKeys` / `outputKeys` 在全库**没有任何读取点**（纯 UI 文档）；
   `inputSchema` / `outputSchema` / `enforceSchema` 只有 proto 映射、**没有校验逻辑**。
-  唯一真正流到 worker 的定义态字段是 `inputTemplate`，而它由服务端在调度那一刻
+  唯一真正流到 worker 的定义态字段是 `inputTemplate`，且由服务端在调度那一刻
   `putIfAbsent` 合并进 `inputData` —— worker 看到的已经是合并后的结果。
 - 输入超过 `taskInputPayloadSizeThreshold`（默认 3072 KB）会被外置：
   `externalizeInput()` 把 `inputData` **清空**只留 `externalInputPayloadStoragePath`，
   而官方 JS SDK **完全不处理这个字段**。不显式取回就会静默拿到 `{}`（§6.5）。
-- `extendLease` 真心跳自 **v3.10.7** 起可用。v0.7 不再使用它 —— 异步化之后 worker
-  从不长时间持有任务，没有续租的必要。
 - ⚠️ `3.21.21` 在 Docker Hub 上**没有发布镜像**（3.21.x 只有 `3.21.24-rc.1`，
   最近的稳定版是 `3.22.x`）。本节结论均据 3.21.21 源码核实。
 
@@ -164,7 +169,8 @@
 | 单次模型调用 | **worker** | `spec.limits.modelCallTimeoutMs` |
 | 单次工具执行 | **worker** | `spec.limits.toolCallTimeoutMs` / `ToolPolicy.timeoutMs` |
 | 一次 agent 运行的总时长 | **worker** | `spec.limits.wallClockMs` |
-| 任务总时长 / 响应超时 / 重试策略 | **引擎** | TaskDef，注册期写入，运行期不读 |
+| 任务总时长 / 重试策略 | **引擎** | TaskDef，注册期写入，运行期不读 |
+| worker 多久没心跳算死 | **引擎** | TaskDef 的 `responseTimeoutSeconds`；心跳由官方 `LeaseTracker` 自动发 |
 
 ## 3. 总体架构
 
@@ -188,14 +194,18 @@ v0.3 的 core 自建了推理循环，因为「要幂等、要扣预算，就得
 
 于是 core 可以变得很薄：**它不写循环，它写拦截器。**
 
-**其二：agent 不该被塞进任务的执行窗口。**
+**其二：编排引擎已经提供了「长任务独占一个 worker」，不该自己再造一遍。**
 
-v0.6 及以前把 agent 切片，让它在 `execute()` 里跑一片就交还。这引入了整条不必要的机制链 ——
-跨分片状态持久化、journal 重放、租约、fencing、交还预算校验 —— 而且它贴着服务端
-**60 秒 unack 窗口**的红线跑（§2.2）。
+v0.6 把 agent 切片塞进 `execute()`，引入了跨分片状态持久化、journal 重放、fencing 一整条机制链。
+v0.7 换成异步后台跑 + 运行注册表，又造了所有权、心跳、孤儿接管一整套。
+两版都在解决同一个自找的问题。
 
-v0.7 反过来：**`execute()` 只是一个查询接口**，agent 在它之外的后台跑。
-callback 从「继续执行的机会」退化成「心跳检查」。整条机制链随之消失。
+真相很简单（§2.2）：**`poll` 成功后任务就从队列里删掉了**，只要 worker 按
+`responseTimeoutSeconds × 0.8` 的节奏发一次 `extendLease`，任务就一直归它，
+想跑多久跑多久。而这个心跳**官方 SDK 的 `LeaseTracker` 已经实现好了**。
+
+于是 `execute()` 回归最朴素的形态：**把 agent 从头跑到完，然后返回**。
+没有分片、没有后台宿主、没有注册表、没有 Redis。
 
 ### 3.2 分层
 
@@ -224,18 +234,20 @@ graph TB
       MG["ManagedModelGateway<br/>决定成本"]
       TG["ManagedToolGateway<br/>决定副作用"]
     end
-    HOST["AgentRunHost<br/>后台运行 + 心跳"]
-    REG["RunRegistry<br/>运行状态的唯一真相源"]
-    BG["BudgetGovernor"]
+    RA["runAgent<br/>装配 + 预算 + 超时"]
   end
 
   subgraph BR["@ca/conductor · 薄桥接层"]
-    CP["Worker 编译"]
-    CB["callback 协议<br/>查状态 / 起运行 / 回执"]
+    CP["Worker 编译<br/>leaseExtendEnabled = true"]
+    IO["运行态输入输出<br/>+ 取消检测 + 进展"]
     RM["ResultMapper"]
   end
 
-  OFF["@io-orkes/conductor-javascript<br/>官方 SDK · poll / 并发 / 指标"]
+  subgraph OFF["@io-orkes/conductor-javascript · 官方 SDK"]
+    TM["TaskManager<br/>poll / 并发 / 停机"]
+    LT["LeaseTracker<br/>extendLease 心跳"]
+  end
+
   CD[("Conductor Server")]
 
   SPEC --> SL
@@ -252,24 +264,19 @@ graph TB
   E2 -.-> GW
   E3 -.-> GW
 
-  MG --> BG
-  TG --> BG
-  HOST --> GW
-  HOST --> REG
-
+  RA --> GW
   CP --> EC
-  CP --> CB
-  CB --> REG
-  CB --> HOST
-  CB --> RM
-  RM --> OFF
-  CP --> OFF
-  OFF --> CD
-  HOST -. "跑完直接回执" .-> CD
+  CP --> RA
+  CP --> IO
+  CP --> RM
+  RM --> TM
+  CP --> TM
+  TM --> CD
+  LT -. "responseTimeout x 0.8" .-> CD
 ```
 
 > 图例：实线为装配与数据流；**虚线为引擎对受管入口的调用**（引擎适配器的唯一硬性义务），
-> 以及后台运行结束时**绕过 callback 直接回执**的那条路径。
+> 以及官方 `LeaseTracker` 独立于我们的调用栈、直接向服务端发心跳的那条路径。
 
 四条结构性约束：
 
@@ -277,7 +284,8 @@ graph TB
 2. **`@ca/core` 不定义统一消息格式**。引擎的消息/状态对 core 是**不透明的可序列化载荷**（§4.5）。
 3. **引擎必须让模型与工具调用经过受管入口**，否则其 `EngineCapabilities` 必须如实声明能力缺失，
    core 据此降级或拒绝启动（§4.4）。
-4. **Conductor 对接层（§5、§6）与引擎无关**：换引擎不影响 callback 协议、注册表、结果映射。
+4. **Conductor 对接层（§5、§6）与引擎无关**：换引擎不影响心跳、输入输出、结果映射。
+5. **心跳不自己实现**：`LeaseTracker` 是官方 SDK 的，我们只打开开关并校验取值（ADR-0022）。
 
 ### 3.3 包划分
 
@@ -288,9 +296,9 @@ graph TB
 | `@ca/engine-harness` | 适配 AI SDK `HarnessAgent`（Claude Code / Codex / Cursor / OpenCode / Pi 等） | **新增** |
 | `@ca/engine-custom` | 最小手写循环参考实现，兼作契约基线与一致性测试样本 | **新增** |
 | `@ca/conductor` | 官方 SDK 之上的薄桥接层 | 不变 |
-| `@ca/memory` | `RedisRunRegistry` / `BlobStore` / `MemoryStore` | v0.7 从 `StateStore` 收缩为运行注册表 |
+| `@ca/memory` | `BlobStore` / `MemoryStore` | **可选** —— 只在结果超出 outputData 预算时用得上 |
 | `@ca/observability` | OTel GenAI span 与 Agent 语义指标 | 不变 |
-| `@ca/testing` | 引擎一致性套件、注册表一致性套件、脚本化模型、失联/并发注入 | 职责扩展 |
+| `@ca/testing` | 引擎一致性套件、脚本化模型、契约测试设施 | 职责扩展 |
 | `@ca/cli` | 脚手架、TaskDef 注册、spec 校验与 diff、运行状态查看、插件/包列表 | 增加 spec 能力 |
 | ~~`@ca/providers-anthropic`~~ / ~~`@ca/providers-openai`~~ | — | **删除**：AI SDK provider 生态已覆盖 |
 | ~~`@ca/tools-mcp`~~ | — | **删除**：`@ai-sdk/mcp` 已覆盖本地 stdio / Streamable HTTP |
@@ -551,41 +559,51 @@ interface ToolPolicy {
 未在 `toolPolicies` 中声明的工具默认按 `pure` 处理并发出运行时告警；
 `strictPolicies: true` 下拒绝注册未声明策略的工具。
 
-### 4.7 等待外部（HITL / 慢接口）：在运行内部 await
+### 4.7 等待外部（HITL / 慢接口）：按时长分两档
 
-异步化把这件事变简单了。agent 在后台跑，**它本来就可以等** —— 不需要交还任务、
-不需要持久化状态、不需要把决定回灌进来。
+extendLease 模式下 agent 独占一个 worker 直到跑完，所以「等」这件事有明确的成本边界：
+等的时候占着一个并发槽。据此分两档。
 
-**M1 的做法：把等待放进工具里。**
+**短等待（秒级到分钟级：慢接口、外部计算）→ 工具内 `await`。**
 
 ```ts
 tool({
-  description: '发起退款（需要人工审批）',
-  inputSchema: z.object({ orderId: z.string(), amount: z.number() }),
   execute: async (input, { idempotencyKey }) => {
-    const ticket = await approvals.create(input, idempotencyKey);
-    await approvals.waitUntilDecided(ticket);   // ← 就在这里等，等多久都行
-    if (!ticket.approved) throw new CaError('审批被拒', false);
-    return refunds.execute(input, { idempotencyKey });
+    const job = await vendor.submit(input, idempotencyKey);
+    return vendor.waitUntilDone(job);        // ← 就在这等
   },
 })
 ```
 
-期间发生的事：受管工具入口按 `ToolPolicy.timeoutMs` 计时（长等待要相应放大或设 0），
-后台宿主照常心跳，`execute()` 照常回执 `IN_PROGRESS`，工作流在 UI 上看得到「还活着、停在
-`tool:requestRefund`」。等待期不占任何 worker 并发槽 —— 那个槽在毫秒级的 `execute()` 返回时就还回去了。
+期间受管工具入口按 `ToolPolicy.timeoutMs` 计时，官方 `LeaseTracker` 照常心跳，
+任务在 Conductor UI 上一直是 `IN_PROGRESS`。
 
-**引擎级的两段式审批（`suspend: 'native-approval'`）留到 M2。**
-AI SDK 的 `toolApproval` 会让 `generate()` 返回 `tool-approval-request` 并结束本轮，
-需要引擎适配器在 run 内部接住它、等决定、再继续。这是适配器内部的事，
-桥接层完全不参与 —— 与 v0.6 把挂起做成 Conductor 交还的做法有本质区别。
-M1 的 `ai-sdk/tool-loop` 因此声明 `suspend: 'none'`：spec 里声明 `approval`
-会在**启动时**被拒绝，并提示改用上面的工具内等待。
+**长等待（人工审批、跨天）→ 交给工作流，别让 agent 等。**
 
-> **为什么不做成「交还 + 回灌」**：核实发现 `inputData` 在一个 task 实例的**整个生命周期内是冻结的**
-> —— `updateTask` 只写 `outputData` / `status` / `callbackAfterSeconds`，从不碰 `inputData`，
-> 只有重试（新 taskId）才会重新求值。所以外部决定**根本无法在 callback 等待期间送达同一个任务**。
-> v0.6 的挂起设计在这一点上是错的。详见 [ADR-0019](adr/0019-async-agent-execution.md)。
+```
+agent_审核(判断该不该退款)  →  HUMAN(人工审批)  →  agent_执行退款
+        ↓ COMPLETED                                      ↑
+        outputData = { ok: false, awaiting: {            │
+          kind: 'approval', reason: '金额超限',           │
+          proposal: { orderId, amount } } } ─── SWITCH ──┘
+```
+
+SDK 提供的是「agent 能返回一个结构化的**需要人来定**结果」，复用 §6.2 已有的
+「做不到但流程该继续」映射（`COMPLETED` + `ok:false`）。
+
+为什么不让 agent 自己等几天：
+- 占着一个并发槽不放
+- `wallClockMs` 得设成天级，超时保护形同虚设
+- worker 一挂，等待连同整次运行全丢
+
+Conductor 原生就有 HUMAN / WAIT 任务。**该编排的事交给编排引擎，别在一个 task 里造迷你工作流。**
+
+> 引擎级的两段式审批（`capabilities.suspend = 'native-approval'`）留到 M5，
+> 那是适配器**内部**的短审批循环，桥接层不参与。M1 的 `ai-sdk/tool-loop`
+> 声明 `suspend: 'none'`：spec 里写 `approval` 会在启动时被拒绝并提示改用上面两档。
+>
+> ⚠️ 不要试图「交还任务 + 等外部把决定写回 `inputData`」：`inputData` 在一个 task 实例的
+> 生命周期内是**冻结的**（`updateTask` 从不碰它），决定根本送不进来。
 
 ### 4.8 `RunContext`
 
@@ -617,8 +635,20 @@ interface RunContext {
 
 ### 5.1 一次运行 = 一次完整的 agent 执行
 
-没有分片，没有状态交接。`runAgent()` 装好受管入口（预算、超时、幂等键、事件），
-让引擎从头跑到完成，把结果收回来。agent 的全部状态自始至终在这一次调用的内存里。
+`execute()` 就是把 agent 从头跑到完：
+
+```
+poll → 任务被 ack 从队列删除，只属于这个 worker
+     → execute() 里 runAgent()，跑多久都行
+       官方 LeaseTracker 同时按 responseTimeoutSeconds × 0.8 自动发 extendLease 心跳
+     → 返回终态，任务结束
+
+worker 崩了 → 没人心跳 → responseTimeout 后判 TIMED_OUT
+            → 消耗一次 retryCount → 新 taskId 重新分配给别的 worker
+```
+
+`runAgent()` 装好受管入口（预算、超时、幂等键、事件），让引擎跑到完成，把结果收回来。
+agent 的全部状态自始至终在这一次调用的内存里。
 
 ```ts
 type RunOutcome =
@@ -626,108 +656,63 @@ type RunOutcome =
   | { kind: 'failed'; error: SerializedError; budget: BudgetSnapshot };
 ```
 
-**代价要说清楚**：进程没了，这次运行就没了，重来一次会**重复付费**（ADR-0021）。
-v0.6 的 journal 重放能省下这笔钱，但它的存在前提是分片模型 —— 分片没了，
-journal 的短路也失去了作用点。步级 journal 作为**可选增强**留给 M2，
-默认不开：先让默认路径完全走 Conductor 原生机制，等有实测数据再决定值不值得加回来。
+**「一次执行始终在同一 worker」是引擎保证的**（§2.2），SDK 不需要注册表、
+不需要所有权、不需要心跳实现、不需要任何外部存储。
 
-### 5.2 callback 协议：`execute()` 只回答一个问题
+### 5.2 心跳交给官方 LeaseTracker
 
-```
-poll → execute(task)                       ← 毫秒级返回，从不阻塞
-         registry.tryStart(task.taskId)
-         ├─ 取得所有权   → host.start(后台跑) → IN_PROGRESS + callbackAfterSeconds
-         ├─ 别人在跑     → IN_PROGRESS + callbackAfterSeconds（带进展）
-         ├─ 已是终态     → COMPLETED / FAILED（读注册表里的结果）
-         └─ 宿主失联     → 按 onOrphan：接管重跑 / 判失败
+我们只做两件事：
 
-后台运行结束 → registry.finish() → **直接** updateTask(COMPLETED|FAILED)
-                                   ↑ 不等下一次 callback
+```ts
+{ taskDefName, leaseExtendEnabled: true, execute }   // ① 打开开关
+assertHeartbeatViable(responseTimeoutSeconds)        // ② 启动时校验取值
 ```
 
-**主动回执为什么可行**：核实过 `updateTask` 没有「必须是 poll 到它的那个 worker」的校验，
-且 `SCHEDULED`（等待 callback 中）不是终态 —— 任何持有 taskId 的进程都能把任务推向终态，
-`queueDAO.remove` 会立刻停掉 callback 循环（§2.2）。
+官方 `LeaseTracker` 的行为（源码核实）：
 
-由此 **callback 在正常路径上根本走不到**：它只是宿主失联时的兜底。
-`callbackAfterSeconds` 因此是纯粹的心跳节奏（默认 30 秒），与任何引擎超时无关。
+| 项 | 值 |
+|---|---|
+| 心跳间隔 | `task.responseTimeoutSeconds × 0.8 × 1000` ms |
+| 读的值 | **运行态任务上的快照**（调度那一刻从 TaskDef 复制） |
+| 定时器 | 独立的 100ms 轮询，**并发槽占满也照常心跳** |
+| 请求 | v1 `updateTask({ taskId, workflowInstanceId, status: 'IN_PROGRESS', extendLease: true })` |
+| ⚠️ 静默失效条件 | `intervalMs < 1000`（即 `responseTimeoutSeconds < 1.25`）→ **直接 return，不发心跳** |
 
-主动回执失败（网络抖动）也不是灾难：结果已经在注册表里，下一次 callback 会把它取走。
+最后一条是配置陷阱：设得太小不会报错，只会让任务在 `responseTimeoutSeconds` 后被判死。
+`compileAgentWorker()` 在启动时就拒绝这种配置。
+
+服务端要求 **≥ 3.10.7**（`TaskResult.extendLease` 自该版本引入），
+`assertExtendLeaseSupported()` 可在装配时探测。
 
 ### 5.3 运行的身份就是 `taskId`
 
-这是「同一次执行的多次 callback」与「不同任务」的**唯一**判据
-（[ADR-0020](adr/0020-runid-is-taskid.md)）：
-
-| 标识 | 同一次执行的多次 callback | 重试（新一次执行） | 新工作流实例 |
+| 标识 | 同一次执行 | 重试（新一次执行） | 新工作流实例 |
 |---|---|---|---|
 | **`taskId`** | **不变** | **新生成** | 新生成 |
-| `pollCount` | 1, 2, 3… 递增 | 重置为 0 | 从 0 |
+| `pollCount` | **恒为 1** | 重置为 0 → 1 | 1 |
 | `retryCount` | 不变 | +1 | 0 |
-| `retriedTaskId` | 不变 | 指向上次 taskId | 空 |
-| `outputData` | 上次 callback 写的 | 上次 attempt 最后写的（`task.copy()` 携带） | 空 |
-| `inputData` | **冻结** | 重新求值 | — |
+| `retriedTaskId` | — | 指向上次 taskId | 空 |
+| `outputData` | 结束时写一次 | 上次 attempt 写的（`task.copy()` 携带） | 空 |
+| `inputData` | 冻结 | 重新求值 | — |
 
-依据：callback 走 `updateTask` + `postpone`，**不换 taskId**；重试走
-`DeciderService.retry()` / `WorkflowExecutorOps:453`，两条路径都
-`setTaskId(idGenerator.generate())` + `setPollCount(0)`。
+`pollCount > 1` 或 `retryCount > 0` 就意味着**发生过重新分配**（上一个 worker 崩了或超时），
+这是很有用的运维信号。
 
-所以 `runId = task.taskId`。不需要自己拼 `workflowInstanceId:refName:epoch` ——
-Conductor 已经给了语义完全吻合的标识。`pollCount` / `retryCount` / `retriedTaskId`
-只用于日志与业务判断，**不参与身份判定**。
+`runId = task.taskId`，不需要自拼恢复锚点（[ADR-0020](adr/0020-runid-is-taskid.md)）。
 
-### 5.4 运行注册表
+### 5.4 运行期只有一个周期任务
 
-注册表回答「这个 runId 现在处于什么状态」，是异步化模型唯一需要的共享设施。
+`execute()` 内部起一个 `setInterval`，做两件与心跳无关的事：
 
-```ts
-interface RunRegistry {
-  /** **原子**占位。并发的多个 worker 同时调用，只有一个能拿到 ok:true */
-  tryStart(runId, owner, opts): Promise<TryStartResult>;
-  /** 刷新心跳与进展；返回 false 表示所有权已被接管，调用方应中止运行 */
-  heartbeat(runId, owner, progress?): Promise<boolean>;
-  get(runId): Promise<RunRecord | undefined>;
-  /** 写终态；所有权已易主时忽略写入并返回 false */
-  finish(runId, owner, outcome): Promise<boolean>;
-  drop(runId): Promise<void>;
-}
-```
+1. 把攒下的 Task Log 推给 Conductor（§10.4 —— 运行途中唯一能看见进展的通道）
+2. 查工作流是否已被终止 → `controller.abort()` → 传导到 `ctx.signal`
 
-`tryStart` 的原子性是**必需**的，不是优化：§2.2 的 60 秒 unack 窗口意味着
-两个 worker 同时 poll 到同一个 taskId 是真实场景，非原子占位会让同一次执行跑两遍、重复付费。
-Redis 实现因此用 Lua 而不是「读-判-写」。
+心跳**不在这里** —— 那是 `LeaseTracker` 的事，跑在官方 SDK 自己的定时器上。
 
-| 部署形态 | 实现 |
-|---|---|
-| 单 worker 进程 | `MemoryRunRegistry`（默认） |
-| **多实例** | **`RedisRunRegistry`（必需）** —— Conductor 不保证 callback 回到同一个进程（§2.2） |
+另外还有一个一次性的 `wallClockMs` 定时器：超时就 abort，`execute()` 以终局错误返回，
+不必等引擎判超时。
 
-两种实现跑**同一份**一致性断言（`@ca/testing` 的 `checkRunRegistryConformance`）。
-
-### 5.5 后台运行宿主与失联处置
-
-`AgentRunHost` 负责四件事，边界很窄：
-
-1. 在后台发起一次完整运行（不阻塞调用方）
-2. 周期性刷新注册表心跳 —— 这是「运行还活着」的**唯一**证据
-3. 心跳被拒（所有权已被接管）、运行超时、或工作流被终止时，`abort` 本次运行
-4. 运行结束时写注册表，并立刻回调 `onSettled` 让桥接层主动回执
-
-宿主是**进程内**的：进程没了，运行就没了。这不是遗漏，是选择
-（[ADR-0021](adr/0021-orphan-run-policy.md)）——
-
-| `onOrphan` | 行为 | 代价 |
-|---|---|---|
-| `restart`（默认） | 下一个接到 callback 的 worker **接管重跑整次运行**。taskId 不变，**不消耗 Conductor 重试配额** | 已完成的部分重复付费 |
-| `fail` | 判失败交回引擎，由 `TaskDef.retryCount` 决定是否重试 | 消耗重试配额，行为等价但语义更重 |
-
-`restart` 有上限：注册表的 `attempts` 达到 `maxAttempts`（默认 3）后直接判失败，不无限重启。
-
-失联判据是 `now - updatedAt > orphanAfterMs`（默认 90 秒，需 ≥ 3 × 心跳间隔）。
-心跳来自受管入口产生的进展 —— 所以 `capabilities.progress === 'none'` 的引擎
-会让判定变迟钝，§4.4 对此告警。
-
-### 5.6 副作用与幂等
+### 5.5 副作用与幂等
 
 受管工具入口把 `idempotencyKey = sha256(kind|toolName|归一化输入)#出现序号` 传给工具实现，
 供下游系统自己去重。用**内容**而非顺序作键，因为引擎会并发执行工具，顺序号在并发下不稳定。
@@ -739,23 +724,46 @@ Redis 实现因此用 Lua 而不是「读-判-写」。
 | `pure` / `idempotent` | `retryable: true` | 重跑安全 |
 | `effectful` | **`retryable: false`** | 副作用是否已生效未知，交给工作流的补偿分支决定，不擅自重试 |
 
+### 5.6 明确接受的两条代价
+
+**一、运行途中无法更新 `outputData`。**
+
+`updateTask` 的实现是 `if (taskResult.isExtendLease()) { extendLease(taskResult); return null; }`
+—— 在碰 `outputData` **之前**就 return 了；而正常的 `updateTask(IN_PROGRESS)` 会把任务
+`postpone` 回队列，那就破坏了亲和。
+
+| 通道 | 运行中可见？ |
+|---|---|
+| `outputData.progress`（权威） | ❌ 只在结束时写一次 |
+| Conductor Task Log | ✅ `addTaskLog` 不碰队列，运行途中照常写 |
+
+「运行中就要知道进展」（§10.4）**仍然满足**，但工作流用
+`${ref.output.progress.step}` 做**运行中**分支判断这条路没了。
+
+**二、一个长跑 agent 占住一个并发槽的全程。**
+
+`concurrency` 的含义从「每秒处理几个任务」变成「**同时最多跑几个 agent**」。
+这是亲和的必然代价，也是正确的代价 —— 一次 agent 运行本来就该独占一份资源配额。
+
+**worker 崩溃仍然是整次运行重来**（重复付费）。它现在走的是 Conductor 标准重试路径，
+归因清楚；要止血需要 checkpoint 或 journal，先量数据再决定（§15.3 第 1 条）。
+
 ---
 
 ## 6. Conductor 桥接层
 
-- **6.1 Worker 编译**：`AgentSpec` → 官方 `ConductorWorker`，交给官方 `TaskManager` 托管。
-  `execute()` 的实现就是 §5.2 的 callback 协议。
+- **6.1 Worker 编译**：`AgentSpec` → 官方 `ConductorWorker`（`leaseExtendEnabled: true`），
+  交给官方 `TaskManager` 托管。`execute()` 内就是 `runAgent()`。
 - **6.2 状态映射**：
-  | 运行状态 | Conductor |
+  | 运行结果 | Conductor |
   |---|---|
-  | 正在跑 / 刚发起 | `IN_PROGRESS` + `callbackAfterSeconds` |
   | 完成 | `COMPLETED` |
   | 「做不到但流程该继续」 | `COMPLETED` + `ok:false`（走工作流的 SWITCH 分支） |
   | 可重试失败 | `FAILED`（由 `TaskDef.retryCount` 决定重试） |
   | 终局失败 | 抛 `TerminalTaskError` → 调用方转 `NonRetryableException` |
-- **6.3 Payload 治理**：`outputData` 默认 256KB 预算（比服务端 3072KB 外置阈值保守，
-  留余量给工作流层聚合），超出按 `payloadStrategy` 外置到 `BlobStore` 或截断。
-- **6.4 CancellationWatcher**：轮询 workflow 状态，经心跳传导到 `ctx.signal`（Conductor 不推送取消）。
+- **6.3 Payload 治理**：`outputData` 默认 256KB 预算（比服务端 3072KB 外置阈值保守），
+  超出按 `payloadStrategy` 外置到 `BlobStore` 或截断。
+- **6.4 CancellationWatcher**：轮询 workflow 状态 → `ctx.signal`（Conductor 不推送取消）。
   同工作流的并发查询会被合并与缓存。
 - **6.5 运行态输入输出**：见下。
 - **6.6 TaskDef 推导（注册期）**：见下。
@@ -766,7 +774,7 @@ Redis 实现因此用 Lua 而不是「读-判-写」。
 边界很硬：
 
 - **进** —— `task.inputData` **原样**就是 agent 的输入。没有保留键、没有命名空间、没有魔法。
-- **出** —— `outputData` 由桥接层生成，工作流用 `${ref.output.xxx}` 直接消费。
+- **出** —— `outputData` 由桥接层在**结束时**生成一次。
 
 ```jsonc
 // 工作流定义里作者要写的全部内容
@@ -774,14 +782,12 @@ Redis 实现因此用 Lua 而不是「读-判-写」。
 ```
 
 ```jsonc
-// outputData
-{ "status": "running", "runId": "…", "attempts": 1, "progress": { … } }          // 运行中
-{ "ok": true,  "status": "done",   "runId": "…", "result": { … }, "progress": {…}, "usage": {…} }
-{ "ok": false, "status": "failed", "runId": "…", "error": { name, message, retryable }, … }
+// outputData（只在终态写）
+{ "ok": true,  "status": "done",   "taskId": "…", "result": { … }, "progress": {…}, "usage": {…} }
+{ "ok": false, "status": "failed", "taskId": "…", "error": { name, message, retryable }, … }
 ```
 
-定义态的 `inputKeys` / `outputKeys` / `inputTemplate` **一概不参与**（§2.2 已核实：
-前两者全库无读取点，`inputTemplate` 由服务端在调度时合并进 `inputData`）。
+定义态的 `inputKeys` / `outputKeys` / `inputTemplate` **一概不参与**（§2.2 已核实）。
 
 ⚠️ **大输入必须显式取回。** 服务端外置输入时会把 `inputData` 清空只留
 `externalInputPayloadStoragePath`，而官方 JS SDK 不处理这个字段。
@@ -798,14 +804,15 @@ Redis 实现因此用 Lua 而不是「读-判-写」。
 
 | 字段 | 值 | 理由 |
 |---|---|---|
-| `timeoutSeconds` | **0** | `checkTaskTimeout` 首行即 `<= 0 → return`。长任务不设总时长上限，跑飞由 worker 的 `wallClockMs` 兜底。需要硬 SLA 上限可用 `conductor.taskTimeoutSeconds` 显式指定 |
-| `responseTimeoutSeconds` | **3600**（服务端默认） | 异步化后 worker 从不长时间持有任务，这个值几乎用不上。**刻意不调小**：调小会抢在队列 unack 之前把任务判 `TIMED_OUT` 并消耗一次 `retryCount`（换新 taskId），而队列 unack 走的是同 taskId 重投，更便宜 |
-| `retryCount` | 3 | 留给真正的业务失败。孤儿运行的重启不走这条路（§5.5），不消耗它 |
+| `responseTimeoutSeconds` | **60** | extendLease 模式下这是**崩溃检测灵敏度**，不是运行时长上限。worker 活着就一直心跳、任务想跑多久跑多久；worker 挂了 60 秒后判 `TIMED_OUT` 并重新分配。心跳因此是每 48 秒一次。⚠️ 不能 < 1.25（官方直接跳过心跳），也不宜过小（它同时决定工作流重扫频率） |
+| `timeoutSeconds` | **0** | `checkTaskTimeout` 首行即 `<= 0 → return`。长任务不设总时长上限，跑飞由 worker 的 `wallClockMs` 兜底。需要硬 SLA 上限可用 `conductor.taskTimeoutSeconds` 指定 |
+| `retryCount` | 3 | **worker 崩溃会真的消耗它**，不可为 0 |
 | `retryLogic` / `retryDelaySeconds` | `EXPONENTIAL_BACKOFF` / 5 | |
 | `timeoutPolicy` | `RETRY` | 只对 `timeoutSeconds` 生效，对 `responseTimeout` 无效 |
 
-`diffTaskDefs()` 在启动时比对线上定义与本地推导，**告警不阻塞** —— 这是运维视角的检查，
-漂移了也不影响 `execute()` 的行为（因为它根本不读）。
+`diffTaskDefs()` 在启动时比对线上定义与本地推导，**告警不阻塞**。
+⚠️ 其中 `responseTimeoutSeconds` 的漂移**是要紧的**：`LeaseTracker` 读的是运行态任务上的
+快照值（调度那一刻从线上 TaskDef 复制），线上被调小到 1.25 秒以下会让心跳被静默跳过。
 
 ---
 
@@ -842,7 +849,7 @@ export default definePack({
   "engineOptions": { "model": "claude-sonnet-5", "stopWhen": { "isStepCount": 30 } },
   "toolPolicies": { "openClaim": { "effect": "effectful", "onAmbiguousReplay": "probe" } },
   "limits": { "maxCostUsd": 2, "wallClockMs": 900000 },
-  "conductor": { "callbackAfterSeconds": 30, "domain": "insurance" }
+  "conductor": { "responseTimeoutSeconds": 60, "domain": "insurance" }
 }
 ```
 
@@ -862,7 +869,7 @@ export default definePack({
 ### 7.3 领域定制的扩展位
 
 Domain Pack 可贡献：工具、工具策略、护栏、prompt、引擎预设、spec 片段、eval 数据集、领域 schema。
-**不可贡献**：受管入口的实现、运行注册表语义、Conductor 映射——这些是 core 的不变量。
+**不可贡献**：受管入口的实现、执行与心跳语义、Conductor 映射——这些是 core 的不变量。
 
 > ⚠️ 信任边界：Pack 与引擎适配器都运行在 worker 进程内，具备完整权限，应按依赖审计对待（§9）。
 
@@ -892,18 +899,17 @@ definePack({ name: '@acme/ca-pack-insurance', engines: { 'ai-sdk/tool-loop': '^1
 
 ## 8. 状态、记忆与存储
 
-| 抽象 | 存什么 | 生命周期 | 默认实现 |
+| 抽象 | 存什么 | 生命周期 | 必需？ |
 |---|---|---|---|
-| `RunRegistry` | 运行状态：谁在跑、心跳、进展、结果 | 终态后保留 1 小时（供 callback 取走） | `MemoryRunRegistry`；**多实例必须换 `RedisRunRegistry`** |
-| `BlobStore` | 超预算的 payload、工具产物 | 与审计要求一致（默认 30 天） | `RedisBlobStore` |
+| `BlobStore` | 超出 `outputData` 预算的结果、工具产物 | 与审计要求一致（默认 30 天） | **可选**（不配则按 `payloadStrategy` 截断） |
 | `MemoryStore` | 跨 run 的长期记忆 | 业务定义 | 待实现（M2+） |
 
-**v0.7 删除了 `StateStore`**（journal / 租约 / fence）。分片没了，跨分片状态也就没了；
-agent 的状态自始至终在一次运行的内存里。留下来的共享状态只有一件事：
-**这个 runId 现在在谁手上、跑到哪了**，那就是 `RunRegistry`。
+**SDK 默认零外部依赖。** extendLease 保证一次执行始终在同一个 worker 进程内（§2.2），
+agent 的状态自始至终在这一次 `execute()` 调用的内存里 —— 没有跨进程状态，
+也就没有共享存储的需求。
 
-⚠️ 单实例部署可以用内存注册表；**多实例部署不行** —— Conductor 不保证 callback
-回到同一个 worker 进程（§2.2 已核实无亲和机制），内存注册表会让每个实例各跑一遍。
+v0.6 的 `StateStore`（journal / 租约 / fence）与 v0.7 的 `RunRegistry`（运行注册表）
+都已删除：前者服务于分片模型，后者服务于异步宿主，两者的前提都不成立了。
 
 ---
 
@@ -925,7 +931,7 @@ agent 的状态自始至终在一次运行的内存里。留下来的共享状�
 
 ```
 span: agent.run             (spec.name, engine.id, run_key, workflow_id, tenant)
- ├─ span: agent.run         ← 一次完整运行一个，跨 callback 稳定（runId = taskId）
+ ├─ span: agent.run         ← 一次完整运行一个（runId = taskId，一次执行内恒定）
  │   ├─ span: gen_ai.chat   ← ManagedModelGateway 产生（含 replay 标记）
  │   └─ span: tool.execute  ← ManagedToolGateway 产生（tool.effect, idempotency_key）
  └─ span: agent.slice[1]
@@ -938,19 +944,20 @@ span: agent.run             (spec.name, engine.id, run_key, workflow_id, tenant)
 
 worker 侧指标用官方 SDK 的 Prometheus 采集。本项目补 Agent 语义指标：
 token & cost（按 model / tenant / spec / **engine**）、replay 命中率、工具成功率、
-护栏拦截率、并发抢占次数（`run.contended`）、孤儿接管次数、预算触顶次数、能力降级次数。
+护栏拦截率、worker 崩溃导致的重新分配次数、预算触顶次数、能力降级次数、并发槽占用率。
 
 进展通道自身的健康度（§10.4）：task log 写入失败率、被节流丢弃的进展条数、
 `progress: 'none'` 的降级次数。
 
 三个专门服务于 §15.3 开放问题的观测量：
-**孤儿接管次数 / run**、**接管时已完成的成本**（第 1 条要的数据）、
-**并发抢占次数**（第 3 条）—— 没有数就没法判断该不该把 journal 加回来。
+**崩溃重分配次数**与**崩溃时已花费的成本**（第 1 条要的数据）、
+**并发槽占用率与 P95 运行时长**（第 3 条）—— 没有数就没法判断该不该做 checkpoint、
+也没法给容量规划。
 
 ### 10.3 流式
 
 `StreamSink` 把模型 delta 与工具事件推到 Redis Stream / SSE 网关，
-channel key = `taskId`（跨 callback 稳定，就是 runId）。
+channel key = `taskId`（一次执行内恒定，就是 runId）。
 AI SDK 的 `streamText` / `useChat` 流可直接桥接到这里。
 
 ### 10.4 进展反馈：让编排引擎在运行中就知道进度
@@ -991,19 +998,21 @@ interface ProgressReport {
 
 #### 两条通道，可靠性不同
 
-**通道一：`outputData.progress`（权威、可靠）**
+⚠️ **extendLease 模式把两条通道的角色调换了**（§5.6）：`extendLease` 心跳碰不到
+`outputData`，而正常的 `updateTask(IN_PROGRESS)` 会把任务写回队列、破坏亲和。
+所以运行途中**只有 Task Log 能看见进展**。
 
-每次 callback 交还本身就是一次 task update —— 顺手把注册表里的最新 `progress` 写进
-`outputData`，**零额外请求**。这是唯一能被工作流消费的通道：其他 task 可以读
-`${agent_ref.output.progress.step}` 做 SWITCH 分支、超时告警或通知。
+**通道一：`outputData.progress`（权威，但只在终态）**
 
-> 异步化之后进展还多了一个作用：**它同时是心跳**。后台运行每产生一次进展就刷新一次
-> 注册表的 `updatedAt`，失联判定（§5.5）就建立在这上面。
+任务结束时随结果写一次，**零额外请求**。工作流可以读
+`${agent_ref.output.progress}` 与 `${agent_ref.output.usage}` 做事后分支或成本归集。
+运行**中**读不到 —— 那部分交给通道二。
 
-**通道二：Conductor Task Log（尽力而为、给人看）**
+**通道二：Conductor Task Log（运行中唯一可见，尽力而为）**
 
-`POST /api/tasks/{taskId}/log`（官方 SDK 的 `getTaskContext()?.addLog()`），
-好处是运行**中途**也能写，不必等 callback。由后台宿主在每次心跳时顺带推出去。
+`POST /api/tasks/{taskId}/log`（官方 SDK 的 `TaskClient.addTaskLog`），
+**`addTaskLog` 不碰队列**，所以运行途中随时可写，不影响亲和。
+由 `execute()` 内的周期任务（§5.4）批量推出去。
 但源码核实发现三条硬约束，必须按它们设计：
 
 | 约束（v3.21.21 源码） | 影响 |
@@ -1012,8 +1021,9 @@ interface ProgressReport {
 | `taskExecLogSizeLimit` 默认 **10** | **单次调用**超过 10 条会被静默截断（只保留前 10 条），不是每任务上限 |
 | `asyncIndexingEnabled` 默认 `false` | 索引写在请求路径上，写太频会拖慢服务端 |
 
-**所以 task log 只能当作 UI 上的镜像，不能作为进展的权威来源。**
-进展的真相在 `outputData.progress` 与运行注册表里；task log 丢了不算故障。
+**所以 task log 是运行中唯一可见的通道，但它是尽力而为的。**
+如果部署没启用索引，运行中就看不到进展 —— 我们会在启动时探测并**告警一次**，
+而不是让用户以为写了、其实什么都没有。终态的 `outputData.progress` 始终可靠。
 
 #### 写入策略
 
@@ -1029,10 +1039,10 @@ interface ProgressReport {
 
 #### 跨重试的连续性
 
-task log 挂在 `taskId` 上。callback 交还不换 `taskId`，所以同一次执行的日志是连续的；
-但重试会换新 `taskId`，日志就断了。上一次 attempt 的进展由 Conductor 原生带在
-`task.outputData.progress` 里（§2.2），新 `taskId` 的第一条 log 据此输出一句
-「↻ 上次 attempt 停在第 N 步（累计 X tokens / $Y），本次重新开始」把断点接上。
+task log 挂在 `taskId` 上。extendLease 期间 `taskId` 不变，所以一次执行的日志是连续的；
+但 worker 崩溃 → `TIMED_OUT` → 重试会换新 `taskId`，日志就断了。上一次 attempt 的进展
+由 Conductor 原生带在 `task.outputData.progress` 里（§2.2），新 `taskId` 的第一条 log
+据此输出一句「↻ 上次 attempt 停在第 N 步（累计 X tokens / $Y），本次重新开始」把断点接上。
 
 ---
 
@@ -1041,17 +1051,22 @@ task log 挂在 `taskId` 上。callback 交还不换 `taskId`，所以同一次�
 | 层次 | 手段 |
 |---|---|
 | **引擎一致性套件** | `@ca/testing` 导出，对**每个** `AgentEngine`（含用户自建）跑同一套契约测试：受管入口是否真的被全部调用、预算是否在调用前拦住、取消信号是否被尊重、声明的 `capabilities` 是否与实际行为一致 |
-| **注册表一致性套件** | 内存版与 Redis 版跑**同一份**断言：并发 `tryStart` 只有一个成功、非 owner 心跳被拒、失联可接管且 `attempts` 递增、`maxAttempts` 用尽后判失败、非 owner 写终态被拒 |
 | 单元 | 脚本化模型 + 假工具（**不需要装任何 Agent SDK**） |
-| **callback 协议** | 首次发起 / 后续报「正在跑」/ 终态回执 / 主动 `updateTask` / 失联接管 / `onOrphan=fail` |
-| 失联接管 | 两个独立宿主共享一个注册表 → 断言只跑一遍、接管后旧宿主的结果被丢弃 |
+| **execute 契约** | `leaseExtendEnabled` 恒开 / 长任务不被打断 / 失败按可重试性分类 / `wallClockMs` 超时 / 工作流终止即中止 |
+| **心跳配置校验** | `responseTimeoutSeconds < 1.25` 启动即拒绝（官方会静默跳过心跳）；服务端 < 3.10.7 拒绝 |
+| 运行态 I/O | `inputData` 原样透传 / 重试拿得到上次 `outputData` / 外置输入不静默变空 |
 | Spec | 合并语义快照测试；effective spec 的黄金文件 |
 | 进展 | 断言节流生效、单次 `addLog` ≤ 10 条、task log 索引关闭时自动降级且只告警一次（§10.4） |
-| 集成 | docker-compose 起真实 Conductor OSS + Redis；没有就**跳过而不是失败** |
+| 集成 | docker-compose 起真实 Conductor OSS；**不需要 Redis**；没有 Conductor 就**跳过而不是失败** |
 
-**两个一致性套件是最重要的测试资产**。它们都写成**返回违规列表的纯函数**而不是
-`describe/it`，这样才能反过来测「套件本身抓不抓得住一个说谎的实现」——
-基线样本里就包含故意绕开受管入口的假引擎、和并发 `tryStart` 全放行的坏注册表。
+**引擎一致性套件是最重要的测试资产**。它写成**返回违规列表的纯函数**而不是
+`describe/it`，这样才能反过来测「套件本身抓不抓得住一个说谎的引擎」——
+基线样本里就包含故意绕开受管入口、和无视取消信号的假引擎。
+
+端到端最要紧的一条断言是：**运行时长明显超过 `responseTimeoutSeconds`，任务却是 `COMPLETED`
+而不是 `TIMED_OUT`，且 `pollCount == 1` / `retryCount == 0`** —— 这同时证明了
+心跳生效和「从头到尾同一个 worker」。示例里 `responseTimeoutSeconds = 5s` 而模型第一步
+故意跑 12s，就是为了让这条断言有意义。
 
 #### 上游 SDK 版本：用契约测试，不用版本矩阵
 
@@ -1082,10 +1097,10 @@ task log 挂在 `taskId` 上。callback 交还不换 `taskId`，所以同一次�
 │   ├── conductor/               官方 Conductor SDK 之上的薄桥接层
 │   ├── memory/
 │   ├── observability/
-│   ├── testing/                 引擎一致性套件 + 注册表一致性套件 + 失联/并发注入
+│   ├── testing/                 引擎一致性套件 + 脚本化模型 + 契约测试设施
 │   └── cli/
 ├── examples/
-│   ├── minimal-agent/           ai-sdk/tool-loop + 异步化 callback 协议
+│   ├── minimal-agent/           ai-sdk/tool-loop + extendLease 心跳
 │   ├── hitl-approval/           native-approval → Conductor callback 的同构映射
 │   └── domain-pack/             L1 领域包 + L2 实例 spec
 ├── pnpm-workspace.yaml
@@ -1098,11 +1113,11 @@ task log 挂在 `taskId` 上。callback 交还不换 `taskId`，所以同一次�
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1** 最小可用 ✅ 代码完成 | 异步化执行模型 · 运行注册表（内存 + Redis）· engine-ai-sdk 适配 · Conductor callback 协议 · 进展反馈两通道 · minimal-agent 示例 | 73 个离线测试通过；3 个端到端用例待真机执行（[verification.md](verification.md)） |
-| **M2** 可靠性加固 | 失联注入与接管验证 · 并发 poll 抢占压测 · 主动回执失败的兜底路径 · 大输入取回（`externalInputResolver`）· 步级 journal 作为可选增强的取舍决策 | 失联/并发两类测试全绿；量出「孤儿重启的重复付费成本」再决定要不要加回 journal |
+| **M1** 最小可用 ✅ 代码完成 | extendLease 执行模型 · 受管入口与预算/超时 · engine-ai-sdk 适配 · 运行态 I/O · 进展反馈 · minimal-agent 示例 | 54 个离线测试通过；3 个端到端用例待真机执行（[verification.md](verification.md)） |
+| **M2** 可靠性加固 | worker 崩溃注入与重新分配验证 · 大输入取回（`externalInputResolver`）· 长任务压测（心跳在并发槽占满时的表现）· checkpoint / journal 的取舍决策 | 崩溃重分配测试全绿；量出「崩溃时已花费的成本」再决定要不要加 checkpoint |
 | **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效 |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
-| **M5** 生态与交互 | 引擎级两段式审批（`suspend: 'native-approval'`）、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
+| **M5** 生态与交互 | 长等待编排模式（agent 返回 `awaiting` + HUMAN 任务）、引擎级两段式审批、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
 | **M6** 生产化 | OTel、Agent 语义指标、预算治理、多租户、CLI 完善、文档站 | 压测报告 + 运维手册 |
 
 M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
@@ -1117,24 +1132,25 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | [0001](adr/0001-worker-closed-loop.md) | Worker 内闭环 vs. Conductor 全编排 | Accepted |
 | [0002](adr/0002-own-rest-client.md) | 自持 REST 客户端 | **Superseded by 0006** |
 | [0003](adr/0003-journaled-replay.md) | Journaled Replay | **Superseded by 0019** |
-| [0004](adr/0004-lease-strategy.md) | 双租约策略 | **Revised by 0007，整体 Superseded by 0019** |
-| [0005](adr/0005-effectful-tool-default.md) | `effectful` 工具默认 `fail` | **Amended by 0019**（作用点从「模糊重放」改为「超时上报」） |
+| [0004](adr/0004-lease-strategy.md) | 双租约策略 | **结论在 0022 中被重新采纳** |
+| [0005](adr/0005-effectful-tool-default.md) | `effectful` 工具默认 `fail` | **Amended by 0019**（作用点改为「超时上报」） |
 | [0006](adr/0006-build-on-official-sdk.md) | 构建在官方 Conductor SDK 之上 | Accepted |
-| [0007](adr/0007-lease-strategies-revised.md) | 三租约策略 | **Superseded by 0019** |
+| [0007](adr/0007-lease-strategies-revised.md) | 三租约策略 | **由 0022 收敛为单一 extendLease** |
 | [0008](adr/0008-relation-to-official-agent-layer.md) | 与官方 agents 层的边界 | Resolved：不采用 |
-| [0009](adr/0009-default-callback-strategy.md) | 默认 `callback` 策略 | **Superseded by 0019**（callback 保留，但语义从「分片」变成「心跳」） |
+| [0009](adr/0009-default-callback-strategy.md) | 默认 `callback` 策略 | **Superseded by 0022**（决定与理由都是错的） |
 | [0010](adr/0010-pluggable-agent-strategy.md) | 可插拔 `AgentStrategy` | **Superseded by 0011** |
 | [0011](adr/0011-agent-engine-over-strategy.md) | `AgentEngine` 取代自研 `AgentStrategy` | Accepted |
 | [0012](adr/0012-reliability-by-interception.md) | 可靠性通过拦截实现，而非拥有循环 | Accepted（受管入口的作用由 0019 收窄） |
 | [0013](adr/0013-agent-spec-and-domain-packs.md) | `AgentSpec` 与 L0/L1/L2 领域定制 | Accepted |
-| [0014](adr/0014-native-approval-only-suspension.md) | 挂起只走引擎原生审批 | **Superseded by 0019**（挂起改为运行内 await） |
+| [0014](adr/0014-native-approval-only-suspension.md) | 挂起只走引擎原生审批 | **Superseded by 0019** |
 | [0015](adr/0015-slice-budget-negotiation.md) | 分片边界：core 给预算、引擎翻译 | **Superseded by 0019**（分片已删除） |
-| [0016](adr/0016-resume-decision-from-journal.md) | 用自己的 journal 终态区分崩溃与业务失败 | **Superseded by 0019/0021** |
+| [0016](adr/0016-resume-decision-from-journal.md) | 用 journal 终态区分崩溃与业务失败 | **Superseded by 0019/0021** |
 | [0017](adr/0017-engine-contract-version.md) | 引擎契约版本与领域包兼容 | Accepted |
-| [0018](adr/0018-progress-reporting.md) | 进展反馈双通道 | Accepted（进展在 0019 之后兼任心跳） |
-| **[0019](adr/0019-async-agent-execution.md)** | **agent 执行与编排任务解耦；删除分片、journal、租约、fencing** | **Accepted** |
-| **[0020](adr/0020-runid-is-taskid.md)** | **运行标识就是 `taskId`；TaskDef 是只写不读的注册期契约** | **Accepted** |
-| **[0021](adr/0021-orphan-run-policy.md)** | **孤儿运行默认接管重跑，不消耗编排引擎的重试配额** | **Accepted** |
+| [0018](adr/0018-progress-reporting.md) | 进展反馈双通道 | Accepted（两条通道的角色在 0022 中调换） |
+| [0019](adr/0019-async-agent-execution.md) | 一次运行从头跑到完成；删除分片、journal、fencing | **部分被 0022 取代；其第一条论据经复核不成立** |
+| [0020](adr/0020-runid-is-taskid.md) | 运行标识就是 `taskId`；TaskDef 只写不读 | Accepted |
+| [0021](adr/0021-orphan-run-policy.md) | 孤儿运行接管重跑 | **Superseded by 0022**（概念本身消失） |
+| **[0022](adr/0022-lease-extend-worker-affinity.md)** | **用 extendLease 心跳保证「一次执行始终在同一 worker」** | **Accepted** |
 
 ---
 
@@ -1144,39 +1160,38 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 
 | 原问题 | 结论 | 出处 |
 |---|---|---|
-| `WorkflowSweeper` 实际扫描周期未知 | 检测延迟 ≈ `responseTimeoutSeconds + 1s`；但异步化之后恢复主要由**队列 60 秒 unack** 完成，不靠它 | §2.2 |
-| `callbackAfterSeconds` 是否有服务端上限 | **无上限**，只做下限钳制 | §2.2 |
-| `retryCount` 分不清租约超时重试与业务重试 | 不再需要区分：孤儿重启走注册表的 `attempts`，根本不经过 `retryCount` | §5.5、ADR-0021 |
+| **worker 亲和：同一次执行会不会换 worker** | **extendLease 下不会** —— `poll` 结尾 `ack` 把任务从队列删除，持有期间别人看不到它。callback 才会（每次交还都 `postpone` 写回队列） | §2.2、ADR-0022 |
+| **60 秒 unack 窗口是不是持有时长的红线** | **不是**（v0.7 的错误结论）。它只覆盖 `pop` 到 `ack` 之间的毫秒级间隙 | §2.2 |
+| `retryCount` 分不清租约超时重试与业务重试 | 不再需要区分：worker 崩溃走的就是标准 `TIMED_OUT → retryCount` 路径，语义统一 | §2.2 |
+| `WorkflowSweeper` 实际扫描周期未知 | 检测延迟 ≈ `responseTimeoutSeconds + 1s`；该值同时决定工作流重扫频率 | §2.2 |
 | sandbox 型 harness 的工具拦截能力 | 按**工具来源**分：host-declared 拦得到、内建工具拦不到 | §4.4 |
 | harness 的 `interceptModel` | **全部拦不到，且与沙箱无关** —— 改用 `costVisibility: 'per-turn'` + 轮间预算闸门 | §4.4 |
-| `replay-signal` 挂起路径是否可靠 | 已删除；异步化之后挂起更简单 —— 直接在运行内部 await | §4.7 |
-| `EngineTurn.continue` 的切分时机由谁决定 | **问题消失**：没有分片了 | ADR-0019 |
-| `callback` 分片的 journal 写放大 | **问题消失**：没有 journal 了 | ADR-0019 |
-| `sliceControl: 'none'` 的引擎如何避免撞上 `timeoutSeconds` | **问题消失**：`timeoutSeconds = 0`，长 turn 由 worker 自己的 `wallClockMs` 约束 | §6.6 |
-| worker 亲和：callback 是否回到同一个 worker | **不保证**。队列名不含 `workerId`，全库无亲和机制；`update-v2` 只是链式优化 → 多实例必须用共享注册表 | §2.2、§5.4 |
+| 挂起路径是否可靠 | 短等待在工具内 `await`；长等待交给工作流的 HUMAN 任务 | §4.7 |
+| `EngineTurn.continue` 的切分时机 / journal 写放大 / `sliceControl: 'none'` 的长 turn | **问题消失**：没有分片、没有 journal、`timeoutSeconds = 0` | ADR-0019 |
+| 多实例部署要不要共享存储 | **不要**。extendLease 保证同一执行在同一进程，SDK 默认零外部依赖 | §8、ADR-0022 |
 
 ### 15.2 已定方案、随里程碑落地的
 
 | 问题 | 方案 | 何时 |
 |---|---|---|
 | 上游 AI SDK 演进快，适配器易碎 | 只依赖 3 个稳定 API 面；CI 只跑 `latest` + peerDep 下界（现为 `ai@^7.0.0`）；一致性套件当 canary | M2 |
-| 领域包被引擎升级打穿 | 引擎契约版本（我们自己维护的版本号），Pack 声明兼容范围 | M4，接口在 M1 就位 |
-| 引擎级两段式审批 | M1 用「工具内 await」，M5 补 `suspend: 'native-approval'` 的适配器内部循环 | M5 |
+| 领域包被引擎升级打穿 | 引擎契约版本（我们自己维护的版本号），Pack 声明兼容范围 | M4 |
+| 长等待的编排形状 | agent 返回 `awaiting` 结构 + 工作流接 HUMAN 任务 | M5 |
 
 ### 15.3 仍然开放的（3 条）
 
-1. **孤儿重启的重复付费成本有多大**。
-   `onOrphan: 'restart'` 会把整次运行重跑一遍，已完成的模型调用要重新付钱。
-   v0.6 的步级 journal 能省下这笔钱，但它的存在依赖分片模型。
-   需要在 M2 用真实负载量出「宿主失联频率 × 平均已完成成本」，再决定值不值得把
-   journal 作为可选增强加回来。**在有数据之前不加** —— 那是给一个还没被证明存在的问题写代码。
+1. **worker 崩溃时的重复付费成本有多大**。
+   崩溃 → `TIMED_OUT` → 新 taskId → 整次运行重来，已完成的模型调用要重新付钱。
+   缓解手段是把会话状态 checkpoint 到 `outputData`（跨 attempt 由 `task.copy()` 原生携带），
+   但受 3072 KB 外置阈值限制，且需要引擎支持导出/导入状态。
+   需要在 M2 量出「崩溃频率 × 崩溃时已花费」再决定值不值得做。**在有数据之前不做。**
 
 2. **`costVisibility: 'per-turn'` 下的超支敞口有多大**。
    轮间闸门只能在**一轮结束后**结账，单轮内烧掉多少不可控。
    需要在 M3 用真实 harness 量出「单轮成本分布」，再决定是否要求这类 spec 必须设更保守的
    `maxCostUsd`，或干脆禁止把 harness 用在成本敏感场景。
 
-3. **并发接管的实际发生率**。
-   §2.2 的 60 秒 unack 窗口意味着并发 poll 是真实场景，注册表的原子占位挡住了它。
-   但「挡住」之后那个失败的 worker 只是交还任务、下次再来 —— 如果这种情况频繁发生，
-   说明有别的问题（poll 太密、任务积压）。M2 加一个 `run.contended` 指标观察它。
+3. **并发槽的容量规划**。
+   一个长跑 agent 占住一个槽的全程，`concurrency` 从吞吐参数变成了并行度参数。
+   需要给出选型指引：按「P95 运行时长 × 期望并发」估算实例数，以及队列积压时的表现。
+   M2 压测中给出数据与经验公式。

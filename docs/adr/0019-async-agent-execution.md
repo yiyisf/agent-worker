@@ -1,5 +1,14 @@
 # ADR-0019：Agent 执行与编排任务解耦
 
+> ⚠️ **部分被 [ADR-0022](0022-lease-extend-worker-affinity.md) 取代（v0.8），且本文第一条论据不成立。**
+>
+> **保留**：一次运行从头跑到完成、不切片；删除 journal / 跨分片状态 / fencing。
+> **取代**：异步宿主、运行注册表、callback 心跳协议 —— 改用 extendLease，由官方 LeaseTracker 托管。
+> **更正**：下文「队列有 60 秒 unack 窗口，worker 持有任务超过它会被并发取走」**是错的**。
+> `ExecutionService.poll` 的最后一行 `ackTaskReceived` → `queueDAO.ack` →
+> `DELETE FROM queue_message`，**poll 之后任务已不在队列里**；那个窗口只覆盖
+> `pop` 到 `ack` 之间的毫秒级间隙。详见 ADR-0022。
+
 - 状态：**Accepted**（v0.7）
 - Supersedes：[0003](0003-journaled-replay.md)、[0004](0004-lease-strategy.md)、[0007](0007-lease-strategies-revised.md)、[0009](0009-default-callback-strategy.md)、[0014](0014-native-approval-only-suspension.md)、[0015](0015-slice-budget-negotiation.md)、[0016](0016-resume-decision-from-journal.md)
 - Amends：[0005](0005-effectful-tool-default.md)、[0012](0012-reliability-by-interception.md)

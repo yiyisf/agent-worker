@@ -1,7 +1,9 @@
 # ADR-0007：三租约策略 —— lease-extend / callback / hybrid
 
-> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
-> 三种租约策略随分片模型一起删除。`extendLease` 的版本核实结论仍然成立，但不再被使用。
+> ℹ️ **由 [ADR-0022](0022-lease-extend-worker-affinity.md)（v0.8）收敛为单一策略。**
+> 三选一没有意义：只有 extendLease 能保证「一次执行始终在同一 worker」，
+> 所以本 SDK **恒用 extendLease**，不再暴露 `leaseStrategy` 配置。
+> 本文对 `extendLease` 服务端可用范围（≥ 3.10.7）的核实结论仍然有效并被沿用。
 
 - 状态：Accepted（Revises [ADR-0004](0004-lease-strategy.md)）
 - 日期：2026-09-05

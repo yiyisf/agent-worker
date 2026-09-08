@@ -10,7 +10,7 @@ import type { Guardrail } from './guardrail.js';
 
 /**
  * 领域包（L1）。可贡献：工具、工具策略、护栏、prompt、spec 片段、eval 数据集、领域 schema。
- * **不可**贡献：受管入口的实现、运行注册表语义、Conductor 映射 —— 那些是 core 的不变量。
+ * **不可**贡献：受管入口的实现、执行与心跳语义、Conductor 映射 —— 那些是 core 的不变量。
  *
  * ⚠️ Pack 与引擎适配器同进程运行、具备完整权限，应按依赖审计对待（§9）。
  */

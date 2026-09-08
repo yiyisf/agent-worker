@@ -45,21 +45,19 @@ export interface AgentLimits {
   toolCallTimeoutMs?: number;
 }
 
-/** 后台运行的宿主进程没了（崩溃 / 重启）时怎么办，见 ADR-0021 */
-export type OrphanPolicy =
-  /** 由下一个接到 callback 的 worker 重新发起整个运行；**不消耗 Conductor 重试配额** */
-  | 'restart'
-  /** 判失败交回引擎，由 TaskDef.retryCount 决定是否重试 */
-  | 'fail';
-
 export interface ConductorTaskOptions {
   taskType: string;
   domain?: string;
-  /** 每次交还任务时请求的回调间隔（秒）。这是**心跳节奏**，与任何引擎超时无关，默认 30 */
-  callbackAfterSeconds: number;
-  /** 运行心跳多久没更新就认定宿主已死，默认 90_000（≥ 3 × callbackAfterSeconds） */
-  orphanAfterMs: number;
-  onOrphan: OrphanPolicy;
+  /**
+   * 崩溃检测灵敏度，默认 60 秒。它有两个作用（ADR-0022）：
+   *   1. worker 持有任务期间多久不心跳就被判 TIMED_OUT（消耗一次 retryCount，任务重新分配）
+   *   2. 官方 LeaseTracker 按 responseTimeoutSeconds × 0.8 的间隔自动发心跳
+   * 低于 1.25 秒时官方心跳会**跳过不发**（算出的间隔 < 1000ms），因此有下限校验。
+   * 另注：该值同时决定 Conductor 重扫这个工作流的频率（WorkflowSweeper.unack = 它 + 1 秒）。
+   */
+  responseTimeoutSeconds: number;
+  /** 任务总时长上限，0 = 不限（默认）。跑飞由 worker 自己的 limits.wallClockMs 兜底 */
+  taskTimeoutSeconds: number;
   payloadStrategy: 'externalize' | 'truncate' | 'fail';
   maxOutputBytes: number;
 }
@@ -95,5 +93,4 @@ export interface EffectiveSpec extends AgentSpec {
 export const DEFAULT_WALL_CLOCK_MS = 1_800_000;
 export const DEFAULT_MODEL_CALL_TIMEOUT_MS = 120_000;
 export const DEFAULT_TOOL_CALL_TIMEOUT_MS = 60_000;
-export const DEFAULT_CALLBACK_AFTER_SECONDS = 30;
-export const DEFAULT_ORPHAN_AFTER_MS = 90_000;
+export const DEFAULT_RESPONSE_TIMEOUT_SECONDS = 60;

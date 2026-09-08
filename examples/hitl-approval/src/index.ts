@@ -1,27 +1,35 @@
 /**
- * 示例：等待人工审批的 Agent。目标里程碑 M5。
+ * 示例：需要人工审批的 Agent。目标里程碑 M5。
  *
- * 异步化之后（ADR-0019）这件事变得很简单：agent 在后台跑，**它本来就可以等**。
+ * extendLease 下 agent 独占一个 worker 直到跑完，所以「等」的成本是明确的：
+ * **占着一个并发槽**。据此按时长分两档（§4.7）。
  *
- * M1 就能用的做法 —— 把等待放进工具里（§4.7）：
+ * ── 短等待（秒级到分钟级）：工具内 await ──
  *
  *     tool({
  *       execute: async (input, { idempotencyKey }) => {
- *         const ticket = await approvals.create(input, idempotencyKey);
- *         await approvals.waitUntilDecided(ticket);   // ← 等多久都行
- *         if (!ticket.approved) throw new CaError('审批被拒', false);
- *         return refunds.execute(input, { idempotencyKey });
+ *         const job = await vendor.submit(input, idempotencyKey);
+ *         return vendor.waitUntilDone(job);       // 就在这等
  *       },
  *     })
  *
- * 期间：受管工具入口按 ToolPolicy.timeoutMs 计时（长审批要放大或设 0），
- * 后台宿主照常心跳，execute() 照常回执 IN_PROGRESS，工作流在 UI 上看得到
- * 「还活着、停在 tool:requestRefund」。等待期**不占任何 worker 并发槽**。
+ * 期间受管工具入口按 ToolPolicy.timeoutMs 计时，官方 LeaseTracker 照常发心跳，
+ * 任务在 Conductor UI 上一直是 IN_PROGRESS。
  *
- * M5 要补的是引擎级的两段式审批（capabilities.suspend = 'native-approval'）：
- * AI SDK 的 toolApproval 让 generate() 返回 tool-approval-request 并结束本轮，
- * 需要适配器在 run 内部接住、等决定、再继续。**这完全是适配器内部的事**，
- * 桥接层不参与 —— 与 v0.6 把挂起做成 Conductor 交还有本质区别。
+ * ── 长等待（人工审批、跨天）：交给工作流，别让 agent 等 ──
+ *
+ *   agent_审核(判断该不该退款)  →  HUMAN(人工审批)  →  agent_执行退款
+ *           ↓ COMPLETED                                      ↑
+ *           outputData = { ok: false, awaiting: {            │
+ *             kind: 'approval', reason: '金额超限',           │
+ *             proposal: { orderId, amount } } } ─── SWITCH ──┘
+ *
+ * SDK 提供的是「agent 能返回一个结构化的**需要人来定**结果」，复用 §6.2 已有的
+ * 「做不到但流程该继续」映射（COMPLETED + ok:false）。
+ *
+ * 为什么不让 agent 自己等几天：占着并发槽不放；wallClockMs 得设成天级、
+ * 超时保护形同虚设；worker 一挂等待连同整次运行全丢。
+ * **该编排的事交给编排引擎，别在一个 task 里造迷你工作流。**
  *
  * ⚠️ 不要试图「交还任务 + 等外部把决定写回 inputData」：核实过 inputData 在一个
  * task 实例的生命周期内是**冻结的**（updateTask 从不碰它），决定根本送不进来。

@@ -16,7 +16,7 @@ import { z } from 'zod';
 import { createAiSdkEngine } from '@ca/engine-ai-sdk';
 import type { AgentSpec } from '@ca/core';
 
-/** 计数器：端到端测试用它断言「一次执行只跑一遍，多次 callback 不会重复发起」 */
+/** 计数器：端到端测试用它断言「一次执行只跑一遍」 */
 export const counters = { modelCalls: 0, toolCalls: 0 };
 
 const usage = (i: number, o: number) => ({
@@ -27,7 +27,8 @@ const usage = (i: number, o: number) => ({
 /**
  * 假模型：先调一次工具，再给出结论。两步。
  * 用假模型而不是真模型，是为了让验证**可重复且零成本**；真实性由 §11 的一致性套件保证。
- * 第一步刻意慢一点，好让任务真的经历几次 IN_PROGRESS 的 callback。
+ * 第一步刻意慢 12 秒 —— 比示例配的 responseTimeoutSeconds(5s) 还长。
+ * 没有 extendLease 心跳的话任务必然被判 TIMED_OUT；能跑完就证明心跳生效了。
  */
 function scriptedModel(): LanguageModel {
   let step = 0;
@@ -36,7 +37,7 @@ function scriptedModel(): LanguageModel {
     doGenerate: async () => {
       counters.modelCalls += 1;
       if (step++ === 0) {
-        await new Promise((r) => setTimeout(r, Number(process.env.CA_DEMO_DELAY_MS ?? 3_000)));
+        await new Promise((r) => setTimeout(r, Number(process.env.CA_DEMO_DELAY_MS ?? 12_000)));
         return {
           content: [
             {
@@ -106,10 +107,12 @@ export const orderAgentSpec: AgentSpec = {
     toolCallTimeoutMs: 30_000,
   },
   conductor: {
-    // 心跳节奏。设小只是为了让示例跑得快一点，生产默认 30s
-    callbackAfterSeconds: 2,
-    orphanAfterMs: 20_000,
-    onOrphan: 'restart',
+    /**
+     * 崩溃检测灵敏度。官方 LeaseTracker 按它 ×0.8 发心跳（这里 = 每 4 秒）。
+     * 示例故意设成 5 秒、而模型第一步要跑 12 秒 —— 心跳不生效的话任务必然被判
+     * TIMED_OUT，所以「能跑完」本身就是心跳生效的证据。生产默认 60 秒。
+     */
+    responseTimeoutSeconds: 5,
   },
 };
 

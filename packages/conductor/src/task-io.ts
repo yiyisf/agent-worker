@@ -20,10 +20,10 @@ export interface ConductorTaskLike {
   correlationId?: string;
   /** >0 说明是重试，outputData 里带着上次 attempt 的结果 */
   retryCount?: number;
-  /** 这个 taskId 被 poll 了几次 = 第几次 callback。诊断用，不作真相源 */
+  /** 这个 taskId 被 poll 了几次。extendLease 模式下正常是 1，>1 说明发生过重新分配 */
   pollCount?: number;
   inputData?: Record<string, unknown>;
-  /** 上一次 callback 或上一次 attempt 写入的 outputData —— 引擎原生携带 */
+  /** 上一次 attempt 写入的 outputData —— 重试时由引擎原生携带（task.copy() 不重置它） */
   outputData?: Record<string, unknown>;
   /** 输入超过服务端阈值（默认 3072 KB）时，inputData 为空，真实内容在这个路径下 */
   externalInputPayloadStoragePath?: string;
@@ -68,49 +68,42 @@ export function previousAttemptOf(task: ConductorTaskLike): JsonValue | undefine
   return out as JsonValue;
 }
 
-export interface RunningOutput extends JsonObject {
-  status: 'running';
-  runId: string;
-  attempts: number;
-}
-
-export function runningOutput(args: {
-  runId: string;
-  attempts: number;
-  progress?: ProgressReport | undefined;
-}): JsonObject {
+/**
+ * outputData 只在**任务结束时**写一次。
+ *
+ * extendLease 心跳走的是 `updateTask({ extendLease: true })`，服务端在
+ * `if (taskResult.isExtendLease()) { extendLease(taskResult); return null; }` 就 return 了，
+ * **碰不到 outputData**。运行途中的进展因此只能走 Task Log 通道（§10.4）。
+ */
+function withProgress(base: JsonObject, progress?: ProgressReport): JsonObject {
+  if (!progress) return base;
   return {
-    status: 'running',
-    runId: args.runId,
-    attempts: args.attempts,
-    ...(args.progress ? { progress: args.progress as unknown as JsonValue } : {}),
+    ...base,
+    progress: progress as unknown as JsonValue,
+    usage: progress.usage as unknown as JsonValue,
   };
 }
 
 export function doneOutput(args: {
-  runId: string;
+  taskId: string;
   result: JsonValue;
   progress?: ProgressReport | undefined;
 }): JsonObject {
-  return {
-    ok: true,
-    status: 'done',
-    runId: args.runId,
-    result: args.result,
-    ...(args.progress ? { progress: args.progress as unknown as JsonValue, usage: args.progress.usage as unknown as JsonValue } : {}),
-  };
+  return withProgress({ ok: true, status: 'done', taskId: args.taskId, result: args.result }, args.progress);
 }
 
 export function failedOutput(args: {
-  runId: string;
+  taskId: string;
   error: SerializedError;
   progress?: ProgressReport | undefined;
 }): JsonObject {
-  return {
-    ok: false,
-    status: 'failed',
-    runId: args.runId,
-    error: { name: args.error.name, message: args.error.message, retryable: args.error.retryable },
-    ...(args.progress ? { progress: args.progress as unknown as JsonValue, usage: args.progress.usage as unknown as JsonValue } : {}),
-  };
+  return withProgress(
+    {
+      ok: false,
+      status: 'failed',
+      taskId: args.taskId,
+      error: { name: args.error.name, message: args.error.message, retryable: args.error.retryable },
+    },
+    args.progress,
+  );
 }

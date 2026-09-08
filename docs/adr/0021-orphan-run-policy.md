@@ -1,5 +1,10 @@
 # ADR-0021：孤儿运行默认接管重跑，不消耗编排引擎的重试配额
 
+> ⚠️ **Superseded by [ADR-0022](0022-lease-extend-worker-affinity.md)（v0.8）。**
+> 孤儿运行这个概念本身消失了：extendLease 模式下任务 poll 后即从队列删除、由同一 worker
+> 持有到底，worker 崩溃走的是 Conductor 标准重试路径（`TIMED_OUT` → `retryCount` → 新 taskId），
+> 不需要我们自己的接管逻辑。
+
 - 状态：**Accepted**（v0.7）
 - 相关：[0019](0019-async-agent-execution.md)、[0020](0020-runid-is-taskid.md)
 - Supersedes：[0016](0016-resume-decision-from-journal.md)

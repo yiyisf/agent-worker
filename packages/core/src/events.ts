@@ -3,7 +3,7 @@ import type { JsonValue } from './spec.js';
 import type { Usage } from './gateway.js';
 
 export type AgentEvent =
-  | { type: 'run.started'; runId: string; spec: string; engine: string; takeover: boolean }
+  | { type: 'run.started'; runId: string; spec: string; engine: string }
   | { type: 'model.call'; stepId: string; usage?: Usage }
   | { type: 'model.delta'; stepId: string; delta: JsonValue }
   | { type: 'tool.started'; stepId: string; name: string }

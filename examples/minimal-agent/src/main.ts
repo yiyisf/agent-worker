@@ -3,7 +3,7 @@
  *
  *   pnpm --filter @ca-example/minimal-agent start
  *
- * 需要先起 Conductor 与 Redis：
+ * 只需要 Conductor（不需要 Redis）：
  *   docker compose -f examples/minimal-agent/docker-compose.yml up -d
  */
 import { counters } from './agent.js';
@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   const workflowId = await startRun('查一下订单 A-1001 到哪了');
   console.log('   workflowId =', workflowId);
 
-  const deadline = Date.now() + 120_000;
+  const deadline = Date.now() + 180_000;
   let wf = await getWorkflow(workflowId);
   const seen: string[] = [];
   while (Date.now() < deadline && (wf.status === 'RUNNING' || wf.status === undefined)) {
@@ -41,16 +41,21 @@ async function main(): Promise<void> {
   }
   console.log('   任务状态轨迹：', seen.join(' → ') || '（太快，没采到中间态）');
 
+  const t = wf.tasks?.[0];
+  const durationMs = (t?.endTime ?? 0) - (t?.startTime ?? 0);
   console.log('④ 结果');
   console.log('   status  =', wf.status);
+  console.log(`   运行时长 = ${(durationMs / 1000).toFixed(1)}s（responseTimeoutSeconds = 5s）`);
+  console.log(`   pollCount = ${t?.pollCount ?? '?'} / retryCount = ${t?.retryCount ?? 0}`);
   console.log('   output  =', JSON.stringify(wf.output, null, 2));
   console.log(`   真实调用：模型 ${counters.modelCalls} 次 / 工具 ${counters.toolCalls} 次`);
-  console.log(`   （无论被 callback 几次，这两个数都只反映**一次**完整运行）`);
+  console.log('   ↑ 运行时长远超 responseTimeoutSeconds 却没被判超时 = extendLease 心跳生效；');
+  console.log('     pollCount=1 且 retryCount=0 = 从头到尾同一个 worker，没被重新分配。');
 
   const taskId = wf.tasks?.[0]?.taskId;
   if (taskId) {
     const logs = await getTaskLogs(taskId);
-    console.log('⑤ Conductor Task Log（进展的尽力而为通道）');
+    console.log('⑤ Conductor Task Log（extendLease 下唯一的运行中进展通道）');
     if (logs.length === 0) {
       console.log('   （空 —— 该部署可能未启用 task log 索引，属预期降级，见 §10.4）');
     }

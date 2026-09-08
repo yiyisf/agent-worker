@@ -1,4 +1,4 @@
-# M1 验证清单（v0.7 异步化模型）
+# M1 验证清单（v0.8 extendLease 模式）
 
 > 这一步需要在**你的机器上**执行：本项目的开发环境没有 docker daemon，
 > 所以真实 Conductor 上的验证无法在这里完成。下面每一条都给了命令、预期输出、
@@ -9,7 +9,9 @@
 | 依赖 | 说明 |
 |---|---|
 | Node.js ≥ 20、pnpm 9 | `pnpm install` |
-| Docker（带 daemon） | 起 Conductor 与 Redis |
+| Docker（带 daemon） | 起 Conductor |
+| Conductor OSS | **≥ 3.10.7**（`TaskResult.extendLease` 自该版本引入） |
+| Redis | **不需要**。SDK 默认零外部依赖 |
 | LLM key | **不需要**。示例默认用确定性的脚本化模型，验证零成本、可重复 |
 
 ### ⚠️ 关于 Conductor 镜像版本
@@ -21,7 +23,6 @@
 - 要对着你自己的 3.21.21 构建验证：`CONDUCTOR_IMAGE_TAG=3.21.21 docker compose up -d`。
 - 我们依赖的服务端语义都是照着 **3.21.21 的源码**核实的，
   见 [architecture.md §2.2](architecture.md#22-服务端语义v32121-源码核实结论)。
-  若你在 3.22.x 上跑出与文档不符的行为，那是一条值得记录的新发现。
 
 ---
 
@@ -29,16 +30,15 @@
 
 ```bash
 docker compose -f examples/minimal-agent/docker-compose.yml up -d
-docker compose -f examples/minimal-agent/docker-compose.yml ps
 curl -sf http://localhost:8080/health && echo OK
 ```
 
-**预期**：三个容器 healthy（`ca-conductor`、`ca-conductor-postgres`、`ca-redis`）；
-`curl` 返回 `OK`。Conductor 首次启动要建表，约 60–90 秒。UI 在 <http://localhost:8080>。
+**预期**：`OK`。Conductor 首次启动要建表，约 60–90 秒。UI 在 <http://localhost:8080>。
 
 > compose 选的是 **postgres 变体**（`CONFIG_PROP=config-postgres.properties`）：
-> 不需要 Elasticsearch，且它的 `conductor.indexing.type=postgres` 意味着
-> **task log 照样能存** —— §10.4 的通道二可以被真正验证到。
+> 不需要 Elasticsearch，且 `conductor.indexing.type=postgres` 意味着
+> **task log 照样能存** —— §10.4 的运行中通道可以被真正验证到。
+> compose 里的 Redis 服务是**可选的**（只给 `BlobStore` 用），SDK 本身不连它。
 
 ---
 
@@ -47,15 +47,10 @@ curl -sf http://localhost:8080/health && echo OK
 ```bash
 pnpm install
 pnpm build
-CONDUCTOR_SERVER_URL=http://localhost:8080/api \
-CA_TEST_REDIS_URL=redis://127.0.0.1:6380 \
-pnpm test
+CONDUCTOR_SERVER_URL=http://localhost:8080/api pnpm test
 ```
 
-**预期**：`76 passed`（其中 3 个 e2e 用例此前会被跳过，现在应当执行）。
-
-若看到 `Test Files 11 passed | 1 skipped`，说明 e2e 仍被跳过 ——
-检查 `curl http://localhost:8080/health` 与 `redis-cli -p 6380 ping`。
+**预期**：`57 passed`（其中 3 个 e2e 用例此前会被跳过，现在应当执行）。
 
 ---
 
@@ -70,20 +65,24 @@ pnpm --filter @ca-example/minimal-agent start
 ```
 ① 注册 TaskDef 与工作流定义…
 ② 启动 worker（poll 循环由官方 TaskManager 托管）…
+   [order_assistant] extendLease 心跳：每 4s 一次（responseTimeoutSeconds=5），由官方 LeaseTracker 托管
 ③ 触发一次运行…
    workflowId = <uuid>
-   任务状态轨迹： SCHEDULED(poll=1) → IN_PROGRESS(poll=2) → SCHEDULED(poll=2) → COMPLETED(poll=3)
+   任务状态轨迹： IN_PROGRESS(poll=1) → IN_PROGRESS(poll=1) → … → COMPLETED(poll=1)
 ④ 结果
    status  = COMPLETED
+   运行时长 = 12.3s（responseTimeoutSeconds = 5s）
+   pollCount = 1 / retryCount = 0
    output  = {
      "answer": "订单 A-1001 已发货，预计明天送达。",
      "progress": { "phase": "done", "step": 3, "usage": {...} },
      "usage": { "tokens": 360, "costUsd": 0.0018 },
-     "runId": "<taskId>"
+     "taskId": "<taskId>"
    }
    真实调用：模型 2 次 / 工具 1 次
-   （无论被 callback 几次，这两个数都只反映**一次**完整运行）
-⑤ Conductor Task Log（进展的尽力而为通道）
+   ↑ 运行时长远超 responseTimeoutSeconds 却没被判超时 = extendLease 心跳生效；
+     pollCount=1 且 retryCount=0 = 从头到尾同一个 worker，没被重新分配。
+⑤ Conductor Task Log（extendLease 下唯一的运行中进展通道）
    · [1] model · 144 tok / $0.0007
    · [3] done · 360 tok / $0.0018
 ```
@@ -92,22 +91,22 @@ pnpm --filter @ca-example/minimal-agent start
 
 | # | 看什么 | 通过标准 | 对应设计 |
 |---|---|---|---|
-| 1 | 任务状态轨迹里 `poll=` 出现过 **> 1** | 同一个 taskId 被**多次 callback** 取回过 —— 说明 `execute()` 没有阻塞，agent 在后台跑 | §5.2、ADR-0019 |
-| 2 | **真实调用：模型 2 次 / 工具 1 次** | 最关键的一条：脚本化模型逻辑上只有两步，**无论被 callback 几次，真实调用次数都不变** —— 说明注册表的原子占位生效，没有重复发起 | §5.4、ADR-0020 |
-| 3 | `output.runId` == 任务的 `taskId` | 运行标识就是 taskId | ADR-0020 |
-| 4 | `output.progress.step > 0` | 进展的**权威通道**可被工作流消费 | §10.4 |
-| 5 | `output.usage.costUsd > 0` | 成本被记账（示例配了 pricing） | §4.3 |
-| 6 | ⑤ 有日志行且形如 `[3] done · …` | 进展的**尽力而为通道**通了；日志是一行文本，不是 payload | ADR-0018 |
+| 1 | **运行时长 > 5 秒，但 status 是 COMPLETED 不是 TIMED_OUT** | **最关键的一条**：示例的 `responseTimeoutSeconds` 是 5 秒而模型第一步要跑 12 秒。没有 extendLease 心跳的话任务必然被判超时 —— 能跑完本身就是心跳生效的证据 | §5.2、ADR-0022 |
+| 2 | **`pollCount = 1` 且 `retryCount = 0`** | 任务从头到尾没回过队列、没被重新分配 = 同一个 worker 执行到底 | §2.2、§5.3 |
+| 3 | 状态轨迹里**只有 `IN_PROGRESS`**，没有 `SCHEDULED` | extendLease 不把任务写回队列（callback 模式才会出现两者交替） | §2.2 |
+| 4 | **真实调用：模型 2 次 / 工具 1 次** | 一次执行只跑一遍 | §5.1 |
+| 5 | `output.taskId` == 任务的 `taskId` | 运行标识就是 taskId | ADR-0020 |
+| 6 | `output.usage.costUsd > 0` | 成本被记账（示例配了 pricing） | §4.3 |
+| 7 | ⑤ 有日志行 | 运行中的进展通道通了 | §10.4 |
 
 > ⑤ **为空也可能是对的**：若该部署未启用 task log 索引（`NoopIndexDAO`），
-> 我们的自检会关闭通道二并告警一次，程序会打印
+> 我们的自检会关闭这条通道并告警一次，程序会打印
 > 「（空 —— 该部署可能未启用 task log 索引，属预期降级）」，
-> 而权威通道 `output.progress` 仍然有值。这正是 §10.4 设计的降级行为。
-
-> **状态轨迹里看到 `SCHEDULED` 是正常的，不是异常。** 源码核实：worker 回执 `IN_PROGRESS`
-> 时服务端会把 SIMPLE 任务的状态**实际存成 `SCHEDULED`**
-> （`WorkflowExecutorOps.updateTask`）。轨迹里 `IN_PROGRESS` 与 `SCHEDULED` 交替出现，
-> 分别对应「正被某个 worker 持有」与「在队列里等下一次 callback」。
+> 而终态的 `output.progress` 仍然有值。这正是 §10.4 设计的降级行为。
+>
+> ⚠️ **extendLease 模式下运行中看不到 `outputData`**：心跳走的是
+> `updateTask({extendLease:true})`，服务端在写 `outputData` 之前就 return 了。
+> 所以运行途中要看进展只能看 Task Log。这是明确接受的代价（§5.6）。
 
 ---
 
@@ -117,65 +116,63 @@ pnpm --filter @ca-example/minimal-agent start
 
 | 看什么 | 通过标准 |
 |---|---|
-| 任务的 **Status** 变化 | 出现过 `SCHEDULED` / `IN_PROGRESS`，最终 `COMPLETED` |
-| 任务的 **Poll Count** | **> 1** —— 同一次执行被多次 callback |
-| 任务的 **Output** | 有 `status` / `runId` / `progress` / `usage` —— 运行中就能看到进度，不必等结束 |
+| 任务的 **Status** | 全程 `IN_PROGRESS`，最终 `COMPLETED`（不出现 `SCHEDULED`） |
+| 任务的 **Poll Count** | **恒为 1** |
+| 任务的 **Retry Count** | **0** |
+| 任务的 **Update Time** | 运行期间每 4 秒左右刷新一次 —— 那就是心跳 |
+| 任务的 **Output** | 有 `ok` / `taskId` / `result` / `progress` / `usage` |
 | 任务的 **Logs** 标签 | 有若干行 `[n] phase · tok`（索引启用时） |
-| Task Definitions → `agent_order_assistant` | `timeoutSeconds = 0`、`responseTimeoutSeconds = 3600`、`retryCount > 0` |
-
-`timeoutSeconds = 0` 是**长任务不设总时长上限**的证据（`checkTaskTimeout` 首行即
-`<= 0 → return`）；`responseTimeoutSeconds` 保持服务端默认 3600 是**刻意不调小** ——
-调小会抢在队列 60 秒 unack 之前把任务判 `TIMED_OUT` 并消耗一次 `retryCount`。
-见 [architecture.md §6.6](architecture.md#66-taskdef-推导注册期只写不读)。
+| Task Definitions → `agent_order_assistant` | `timeoutSeconds = 0`、`responseTimeoutSeconds = 5`、`retryCount > 0` |
 
 ---
 
-## 5. 宿主失联与接管（可选，手动）
+## 5. worker 崩溃与重新分配（可选，手动）
 
-这一条验证「跑 agent 的进程半路没了，任务不会卡死」：
+验证「worker 半路没了，任务不会卡死」：
 
 ```bash
 # 终端 A：起 worker
 pnpm --filter @ca-example/minimal-agent start
-
 # 打印出 workflowId、任务进入 IN_PROGRESS 后，立刻 Ctrl-C 杀掉终端 A
-# 等约 20 秒（示例的 orphanAfterMs），再起终端 B
+
+# 终端 B：起另一个 worker
 pnpm --filter @ca-example/minimal-agent start
 ```
 
-**通过标准**：第二个 worker 接手后工作流能跑完，且它的日志里有一行
+**通过标准**：约 5~10 秒后（`responseTimeoutSeconds` + decider 扫描延迟），
+Conductor 把任务判 `TIMED_OUT` 并生成**新 taskId** 重新分配给终端 B，工作流最终 `COMPLETED`。
+UI 上能看到 `Retry Count = 1`，且 Task 列表里有两条记录（原来那条是 `TIMED_OUT`）。
 
-```
-[order_assistant] <taskId> 接管孤儿运行（第 2 次）：上一个宿主超过 20000ms 无心跳。整次运行将重新开始。
-```
-
-`output.attempts` 应为 `2`，而任务的 `retryCount` 仍为 **0** ——
-接管**不消耗 Conductor 的重试配额**（ADR-0021）。
-
-> ⚠️ 这里会**重复付费**：整次运行重来一遍，已完成的模型调用要重新付钱。
-> 这是 ADR-0019 删除 journal 明确接受的代价，M2 会用实测数据决定要不要把 journal 加回来。
+> ⚠️ 这里会**重复付费**：整次运行重来一遍。这是 ADR-0019 / ADR-0022 明确接受的代价，
+> M2 会用实测数据决定要不要做 checkpoint。
 
 ---
 
-## 6. 并发接管（可选，进阶）
+## 6. 心跳配置的负向验证（可选，5 分钟）
 
-验证「两个 worker 实例同时 poll 到同一个任务时，只有一个会真的发起运行」：
+证明「配置错了会在启动时被拒绝，而不是线上超时才发现」：
+
+把 `examples/minimal-agent/src/agent.ts` 里的 `responseTimeoutSeconds` 改成 `1`，再启动。
+
+**通过标准**：启动即报错，信息里说明官方 `LeaseTracker` 在间隔 < 1000ms 时会跳过心跳。
+
+---
+
+## 7. 并发槽占用（可选，理解容量模型）
+
+`concurrency` 的含义在 extendLease 下是「**同时最多跑几个 agent**」，不是吞吐。
+示例配的是 `concurrency: 2`，同时触发 3 个工作流：
 
 ```bash
-# 两个终端各起一个 worker（共享同一个 Redis 注册表）
-pnpm --filter @ca-example/minimal-agent start   # 终端 A
-pnpm --filter @ca-example/minimal-agent start   # 终端 B
+# 触发三次（用 UI 或 curl 都行）
 ```
 
-**通过标准**：两边的「真实调用：模型 N 次」加起来仍然是 **2 次**，不是 4 次。
-其中一个进程会打印它拿到了所有权，另一个只会不断回执 `IN_PROGRESS`。
-
-若加起来是 4 次，说明注册表没用共享实现 —— 检查 Redis 是否连上
-（连不上时程序会打印「退回单进程内存注册表」的告警）。
+**预期**：前两个立刻进入 `IN_PROGRESS`，第三个在队列里等，直到有槽释放。
+这是正常且正确的行为 —— 一次 agent 运行本来就该独占一份资源配额（§5.6）。
 
 ---
 
-## 7. 收尾
+## 8. 收尾
 
 ```bash
 docker compose -f examples/minimal-agent/docker-compose.yml down -v
@@ -187,13 +184,14 @@ docker compose -f examples/minimal-agent/docker-compose.yml down -v
 
 | 现象 | 多半是 |
 |---|---|
-| e2e 被跳过 | Conductor 或 Redis 连不上；检查 `/health` 与 `redis-cli ping` |
-| `pollCount` 恒为 1 | 运行太快，一次 callback 内就跑完了。把 `CA_DEMO_DELAY_MS` 调大 |
-| 真实模型调用次数 > 2 | **注册表没生效** —— 这是严重问题，检查 Redis 是否可写、`runId` 是否等于 `taskId` |
+| e2e 被跳过 | Conductor 连不上；检查 `/health` |
+| 任务变成 `TIMED_OUT` | 心跳没发出去。查 `responseTimeoutSeconds` 是否 < 1.25，以及服务端是否 ≥ 3.10.7 |
+| 状态轨迹里出现 `SCHEDULED` | `leaseExtendEnabled` 没生效，走了 callback 路径 |
+| `pollCount > 1` 或 `retryCount > 0` | 发生过重新分配 —— worker 崩过或心跳断过，查 worker 日志 |
+| 真实模型调用次数 > 2 | 任务被跑了不止一遍，检查上一条 |
 | Task Log 为空 | 多半是部署未启用索引（预期降级）；确认程序是否打印了那句降级告警 |
-| `timeoutSeconds` 不是 0 | TaskDef 是旧的；`registerTask` 用的是覆盖注册，确认没有被别处改过 |
-| 任务长期停在 `SCHEDULED` 不动 | 后台运行挂了但心跳还在，或 `updateTask` 一直失败。查 worker 日志里的 `主动回执失败` |
-| 拉不到镜像 | 见 §0 的版本说明：`3.21.21` 没有发布镜像 |
+| 运行中 `outputData` 一直是空 | **这是预期的**，见 §3 的说明 |
+| 拉不到镜像 | 见 §0：`3.21.21` 没有发布镜像 |
 
-请把实际输出贴回来，尤其是第 3 节的「真实调用」那行、任务的 `pollCount`、
-以及第 4 节的 TaskDef 三个值 —— 如果与预期不符，那是设计或实现的真实缺陷，需要修。
+请把实际输出贴回来，尤其是第 3 节的「运行时长 / pollCount / retryCount」三行
+与第 4 节的 TaskDef 三个值 —— 如果与预期不符，那是设计或实现的真实缺陷，需要修。

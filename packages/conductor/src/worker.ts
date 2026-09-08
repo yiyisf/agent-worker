@@ -1,28 +1,31 @@
 /**
- * 用户入口：把 AgentSpec 挂到 Conductor 上。见 docs/architecture.md §6.1 与 ADR-0019/0020/0021。
+ * 用户入口：把 AgentSpec 挂到 Conductor 上。见 docs/architecture.md §6.1 与 ADR-0022。
  *
- * 本层是**薄桥接**（ADR-0006）：poll 循环、并发、指标、优雅停机全部交给官方
- * `@io-orkes/conductor-javascript` 的 TaskManager。
+ * 本层是**薄桥接**（ADR-0006）：poll 循环、并发、指标、优雅停机、**以及租约心跳**
+ * 全部来自官方 `@io-orkes/conductor-javascript`。
  *
- * execute() 的全部职责是**在毫秒内回答一个问题**：这个 taskId 的运行现在怎么样了？
- * agent 本身在后台跑，与编排任务的执行窗口彻底解耦（ADR-0019）。
+ * execute() 就是**把 agent 从头跑到完**，跑多久都行：
  *
- *   没有       → 取得所有权，后台发起运行，回执 IN_PROGRESS
- *   正在跑     → 回执 IN_PROGRESS（带进展）
- *   跑完了     → 回执 COMPLETED / FAILED
- *   宿主失联   → 按 onOrphan 接管重跑或判失败
+ *   poll → 任务从队列里被 ack 删除，只属于这个 worker
+ *        → execute() 里 runAgent()，官方 LeaseTracker 同时按
+ *          responseTimeoutSeconds × 0.8 的间隔自动发 extendLease 心跳
+ *        → 返回终态，任务结束
  *
- * 运行结束时后台会**直接** updateTask 把任务推向终态，不必等下一次 callback。
+ *   worker 崩了 → 没人心跳 → responseTimeout 后判 TIMED_OUT
+ *               → 消耗一次 retryCount → 新 taskId 重新分配给别的 worker
+ *
+ * 所以「一次执行始终在同一个 worker」是**引擎保证的**，我们不需要运行状态存储、
+ * 不需要所有权、不需要心跳实现、不需要 Redis。
  */
 import {
-  AgentRunHost,
-  DEFAULT_CALLBACK_AFTER_SECONDS,
-  DEFAULT_ORPHAN_AFTER_MS,
-  MemoryRunRegistry,
+  DEFAULT_WALL_CLOCK_MS,
+  RunTimeoutError,
   assertCapabilities,
+  runAgent,
 } from '@ca/core';
 import type {
   AgentEngine,
+  AgentEvent,
   AgentSpec,
   BlobStore,
   BuiltAgent,
@@ -31,10 +34,10 @@ import type {
   JsonValue,
   Logger,
   ProgressReport,
-  RunOutcomeRecord,
-  RunRecord,
-  RunRegistry,
+  RunContext,
+  RunOutcome,
 } from '@ca/core';
+import { CaError } from '@ca/core';
 import {
   createProgressReporter,
   priorAttemptLine,
@@ -46,11 +49,11 @@ import {
   resolveInput,
   doneOutput,
   failedOutput,
-  runningOutput,
   type ConductorTaskLike,
   type ExternalInputResolver,
 } from './task-io.js';
-import { deriveTaskDef, taskTypeOf } from './taskdef.js';
+import { deriveTaskDef, responseTimeoutOf, taskTypeOf } from './taskdef.js';
+import { heartbeatIntervalMs } from './lease.js';
 import {
   TerminalTaskError,
   shrinkOutput,
@@ -67,39 +70,21 @@ export interface CompiledWorker {
   domain?: string;
   concurrency?: number;
   pollInterval?: number;
+  /** 官方 LeaseTracker 的开关 —— 本 SDK 恒为 true，它是「同一 worker」的保证来源 */
+  leaseExtendEnabled: boolean;
 }
-
-/**
- * 主动回执：后台运行结束时直接把任务推向终态。
- * 已核实 `updateTask` 对调用方没有「必须是 poll 到它的 worker」的校验，
- * 且 SCHEDULED（等待 callback 中）不是终态，所以任何持有 taskId 的进程都能推。
- */
-export type UpdateTaskFn = (result: {
-  taskId: string;
-  workflowInstanceId: string;
-  status: 'COMPLETED' | 'FAILED';
-  outputData: Record<string, unknown>;
-  reasonForIncompletion?: string;
-}) => Promise<void>;
 
 export interface CompileDeps {
   engines: readonly AgentEngine[];
-  /**
-   * 运行注册表。默认单进程内存实现 —— **多实例部署必须换成共享实现**
-   * （@ca/memory 的 RedisRunRegistry）：Conductor 不保证 callback 回到同一个 worker。
-   */
-  registry?: RunRegistry;
-  /** 复用同一个后台宿主（多个 spec 共享时传入），不传则每个 worker 自建 */
-  host?: AgentRunHost;
   blobStore?: BlobStore;
   eventSinks?: readonly EventSink[];
   logger?: Logger;
-  workerId?: string;
   /** 大输入取回器；不提供则遇到外置输入直接判终局失败（绝不静默空输入） */
   externalInputResolver?: ExternalInputResolver;
-  /** 不提供则退化为「等下一次 callback 才回执」，正确但慢一个 callback 周期 */
-  updateTask?: UpdateTaskFn;
-  /** 进展的尽力而为通道（§10.4）；不提供则只写权威通道 outputData.progress */
+  /**
+   * 进展的**运行中**通道（§10.4）。extendLease 模式下 outputData 只在结束时写一次，
+   * 所以这是运行途中唯一能看见进度的地方 —— 强烈建议接上。
+   */
   taskLogSink?: (task: ConductorTaskLike) => TaskLogSink | undefined;
   progress?: ConductorProgressOptions;
   onProgress?: (task: ConductorTaskLike, report: ProgressReport) => void;
@@ -109,10 +94,7 @@ export interface CompileDeps {
 }
 
 const noopLogger: Logger = { debug() {}, info() {}, warn() {}, error() {} };
-
-function progressOf(record: RunRecord | RunOutcomeRecord): ProgressReport | undefined {
-  return record.progress;
-}
+const DEFAULT_TICK_MS = 15_000;
 
 /**
  * 把一个 AgentSpec 编译成官方 SDK 认识的 worker。
@@ -133,41 +115,39 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
   });
   for (const w of check.warnings) logger.warn(`[${spec.name}] ${w}`);
 
-  const workerId = deps.workerId ?? `ca-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  const registry = deps.registry ?? new MemoryRunRegistry();
-  const host =
-    deps.host ??
-    new AgentRunHost({
-      registry,
-      workerId,
-      logger,
-      ...(deps.eventSinks ? { eventSinks: deps.eventSinks } : {}),
-    });
+  // 副作用是校验 responseTimeoutSeconds 够不够官方心跳用；取值错了在这里就拒绝
+  const responseTimeoutSeconds = responseTimeoutOf(spec);
+  deriveTaskDef(spec);
+  logger.info(
+    `[${spec.name}] extendLease 心跳：每 ${Math.round(heartbeatIntervalMs(responseTimeoutSeconds) / 1000)}s 一次` +
+      `（responseTimeoutSeconds=${responseTimeoutSeconds}），由官方 LeaseTracker 托管`,
+  );
 
-  const callbackAfterSeconds = spec.conductor?.callbackAfterSeconds ?? DEFAULT_CALLBACK_AFTER_SECONDS;
-  const orphanAfterMs = spec.conductor?.orphanAfterMs ?? DEFAULT_ORPHAN_AFTER_MS;
-  const onOrphan = spec.conductor?.onOrphan ?? 'restart';
+  const wallClockMs = spec.limits?.wallClockMs ?? DEFAULT_WALL_CLOCK_MS;
+  const tickMs = Math.max(1_000, deps.progress?.intervalMs ?? DEFAULT_TICK_MS);
+  const emit = (e: AgentEvent): void => {
+    for (const sink of deps.eventSinks ?? []) void sink.handle(e);
+  };
 
   let built: BuiltAgent | undefined;
 
-  const finalize = async (
-    runId: string,
-    record: RunRecord | RunOutcomeRecord,
+  const toResult = async (
+    taskId: string,
+    outcome: RunOutcome,
+    progress: ProgressReport | undefined,
   ): Promise<MappedTaskResult> => {
-    const progress = progressOf(record);
-    if (record.status === 'done') {
+    if (outcome.kind === 'done') {
       const output = await shrinkOutput(
-        doneOutput({ runId, result: record.result ?? null, progress }),
+        doneOutput({ taskId, result: outcome.output, progress }),
         deps.resultMapper ?? {},
       );
       return { status: 'COMPLETED', outputData: output };
     }
-    const error = record.error ?? { name: 'UnknownError', message: '运行失败但未记录原因', retryable: true };
-    const output = failedOutput({ runId, error, progress });
+    const { error } = outcome;
     if (!error.retryable) throw new TerminalTaskError(error.message);
     return {
       status: 'FAILED',
-      outputData: output,
+      outputData: failedOutput({ taskId, error, progress }),
       reasonForIncompletion: error.message.slice(0, 500),
     };
   };
@@ -175,134 +155,113 @@ export function compileAgentWorker(spec: AgentSpec, deps: CompileDeps): Compiled
   return {
     taskDefName: taskTypeOf(spec),
     ...(spec.conductor?.domain ? { domain: spec.conductor.domain } : {}),
+    // ⚠️ 这一位是整个设计的支点：关掉它，长任务会在 responseTimeout 后被判死并重新分配
+    leaseExtendEnabled: true,
 
     async execute(task: ConductorTaskLike): Promise<MappedTaskResult> {
-      // runId = taskId：同一次执行的多次 callback 共享它，重试则是新的（ADR-0020）
-      const runId = task.taskId;
-      if (!runId) {
-        throw new TerminalTaskError('任务缺少 taskId，无法标识本次运行');
-      }
+      const taskId = task.taskId ?? '';
+      const startedAt = Date.now();
 
-      const started = await registry.tryStart(runId, workerId, {
-        orphanAfterMs,
-        ...(onOrphan === 'fail' ? { maxAttempts: 1 } : {}),
+      const input = await resolveInput(task, deps.externalInputResolver);
+      const previousAttempt = previousAttemptOf(task);
+      if (!built) built = await engine.build(spec, { logger });
+
+      // 取消与超时统一走这一个 signal
+      const controller = new AbortController();
+      const wallClockTimer = setTimeout(
+        () => controller.abort(new RunTimeoutError(wallClockMs)),
+        wallClockMs,
+      );
+      if (typeof wallClockTimer.unref === 'function') wallClockTimer.unref();
+
+      const reporter = createProgressReporter(deps.taskLogSink?.(task), {
+        ...(deps.progress ?? {}),
+        ...(deps.logger ? { logger: deps.logger } : {}),
       });
-
-      // ── 别人正在跑：交还任务，下次 callback 再来看 ──
-      if (!started.ok && started.reason === 'running') {
-        return {
-          status: 'IN_PROGRESS',
-          callbackAfterSeconds,
-          outputData: runningOutput({
-            runId,
-            attempts: started.record.attempts,
-            progress: started.record.progress,
-          }),
-        };
+      // 重试换了新 taskId，task log 会断档；把上次 attempt 的落点接上（原生携带的 outputData）
+      const prior = task.outputData?.progress as ProgressReport | undefined;
+      if ((task.retryCount ?? 0) > 0 && prior?.step) {
+        reporter.report({ ...prior, phase: priorAttemptLine(prior) });
       }
 
-      // ── 已是终态：读结果直接回执（后台主动回执失败时的兜底路径）──
-      if (!started.ok) {
-        await registry.drop(runId);
-        return finalize(runId, started.record);
-      }
+      // 运行期唯一的周期任务：把攒下的 task log 推出去 + 查工作流是否已被终止。
+      // 心跳不在这里 —— 那是官方 LeaseTracker 的事。
+      const tick = setInterval(() => {
+        void (async () => {
+          try {
+            await reporter.drain();
+            if (deps.isWorkflowCancelled && task.workflowInstanceId) {
+              if (await deps.isWorkflowCancelled(task.workflowInstanceId)) {
+                logger.info(`[${spec.name}] ${taskId} 所属工作流已终止，中止运行`);
+                controller.abort(new CaError('所属工作流已终止，放弃本次运行', false));
+              }
+            }
+          } catch (err) {
+            logger.warn(`[${spec.name}] ${taskId} 运行期巡检失败：${String(err)}`);
+          }
+        })();
+      }, tickMs);
+      if (typeof tick.unref === 'function') tick.unref();
 
-      // ── 取得所有权：发起后台运行 ──
-      if (started.takeover) {
-        logger.warn(
-          `[${spec.name}] ${runId} 接管孤儿运行（第 ${started.record.attempts} 次）：` +
-            `上一个宿主超过 ${orphanAfterMs}ms 无心跳。整次运行将重新开始。`,
-        );
-      }
+      const source: ConductorSource | undefined = task.workflowInstanceId
+        ? {
+            workflowInstanceId: task.workflowInstanceId,
+            workflowName: task.workflowType ?? '',
+            taskId,
+            taskReferenceName: task.referenceTaskName ?? '',
+            ...(task.correlationId ? { correlationId: task.correlationId } : {}),
+            retryCount: task.retryCount ?? 0,
+          }
+        : undefined;
+
+      const ctx: RunContext = {
+        runId: taskId,
+        attempt: task.retryCount ?? 0,
+        startedAt,
+        deadline: startedAt + wallClockMs,
+        signal: controller.signal,
+        logger,
+        budget: {
+          usedInputTokens: 0,
+          usedOutputTokens: 0,
+          usedCostUsd: 0,
+          elapsedMs: 0,
+          remaining: () => Infinity,
+        },
+        secrets: { get: async () => undefined },
+        emit,
+        ...(source ? { source } : {}),
+      };
+
+      emit({ type: 'run.started', runId: taskId, spec: spec.name, engine: spec.engine });
 
       try {
-        const input = await resolveInput(task, deps.externalInputResolver);
-        const previousAttempt = previousAttemptOf(task);
-        if (!built) built = await engine.build(spec, { logger });
-
-        const reporter = createProgressReporter(deps.taskLogSink?.(task), {
-          ...(deps.progress ?? {}),
-          ...(deps.logger ? { logger: deps.logger } : {}),
-        });
-        // 重试换了新 taskId，task log 会断档；把上次 attempt 的落点接上（原生携带的 outputData）
-        const prior = (task.outputData?.progress as ProgressReport | undefined);
-        if ((task.retryCount ?? 0) > 0 && prior?.step) {
-          reporter.report({ ...prior, phase: priorAttemptLine(prior) });
-        }
-
-        const source: ConductorSource | undefined = task.workflowInstanceId
-          ? {
-              workflowInstanceId: task.workflowInstanceId,
-              workflowName: task.workflowType ?? '',
-              taskId: runId,
-              taskReferenceName: task.referenceTaskName ?? '',
-              ...(task.correlationId ? { correlationId: task.correlationId } : {}),
-              retryCount: task.retryCount ?? 0,
-            }
-          : undefined;
-
-        host.start({
-          runId,
+        const outcome = await runAgent({
           spec,
           agent: built,
           input: input as JsonValue,
           ...(previousAttempt !== undefined ? { previousAttempt } : {}),
-          attempt: task.retryCount ?? 0,
-          takeover: started.takeover,
-          ...(source ? { source } : {}),
-          ...(deps.progress ? { progressOptions: deps.progress } : {}),
+          ctx,
           onProgress: (r) => {
             reporter.report(r);
             deps.onProgress?.(task, r);
           },
-          onHeartbeat: () => reporter.drain(),
-          ...(deps.isWorkflowCancelled && task.workflowInstanceId
-            ? { shouldAbort: () => deps.isWorkflowCancelled!(task.workflowInstanceId!) }
-            : {}),
-          onSettled: async (outcome) => {
-            reporter.flush();
-            await reporter.drain();
-            if (!deps.updateTask || !task.workflowInstanceId) return;
-            const mapped = await finalize(runId, outcome).catch((err) =>
-              // finalize 对终局错误抛 TerminalTaskError；主动回执路径上翻译成 FAILED
-              ({
-                status: 'FAILED' as const,
-                outputData: failedOutput({
-                  runId,
-                  error: { name: 'TerminalTaskError', message: String((err as Error).message), retryable: false },
-                  progress: outcome.progress,
-                }),
-                reasonForIncompletion: String((err as Error).message).slice(0, 500),
-              }),
-            );
-            await deps.updateTask({
-              taskId: runId,
-              workflowInstanceId: task.workflowInstanceId,
-              status: mapped.status === 'COMPLETED' ? 'COMPLETED' : 'FAILED',
-              outputData: mapped.outputData ?? {},
-              ...(mapped.reasonForIncompletion ? { reasonForIncompletion: mapped.reasonForIncompletion } : {}),
-            });
-            await registry.drop(runId);
-          },
         });
-      } catch (err) {
-        // 发起失败（输入取不回、引擎构建不出来）：立刻把注册表推向终态，
-        // 否则这条 running 记录会一直挂到 orphanAfterMs 才被发现
-        const message = (err as Error)?.message ?? String(err);
-        const retryable = !(err as Error)?.name?.includes('Terminal') &&
-          !(err as Error)?.name?.includes('ExternalInputUnavailable');
-        await registry.finish(runId, workerId, {
-          status: 'failed',
-          error: { name: (err as Error)?.name ?? 'Error', message, retryable },
-        });
-        throw err;
-      }
 
-      return {
-        status: 'IN_PROGRESS',
-        callbackAfterSeconds,
-        outputData: runningOutput({ runId, attempts: started.record.attempts }),
-      };
+        emit({
+          type: 'run.finished',
+          runId: taskId,
+          outcome: outcome.kind === 'done' ? 'ok' : 'error',
+          durationMs: Date.now() - startedAt,
+        });
+
+        return await toResult(taskId, outcome, reporter.snapshot());
+      } finally {
+        clearInterval(tick);
+        clearTimeout(wallClockTimer);
+        reporter.flush();
+        await reporter.drain();
+      }
     },
   };
 }
@@ -315,36 +274,22 @@ export interface AgentWorkerOptions extends CompileDeps {
 export interface AgentWorker {
   workers: CompiledWorker[];
   taskDefs: ReturnType<typeof deriveTaskDef>[];
-  /** 后台宿主，供优雅停机时 drain */
-  host: AgentRunHost;
 }
 
 /**
  * 把一组 AgentSpec 编译成官方 worker 列表 + 对应 TaskDef。
  *
- * 刻意不在这里 new TaskManager：poll 循环、并发、优雅停机是官方 SDK 的职责，
- * 由调用方决定怎么装配（也便于混用已有的普通 worker）。用法：
+ * 刻意不在这里 new TaskManager：poll 循环、并发、优雅停机是官方 SDK 的职责。
  *
- *   const { workers, taskDefs, host } = createAgentWorker({ specs, engines, updateTask });
+ *   const { workers, taskDefs } = createAgentWorker({ specs, engines });
  *   for (const def of taskDefs) await metadataClient.registerTask(def);
  *   new TaskManager(client, workers, { options: { concurrency: 4 } }).startPolling();
- *   // 停机：manager.stopPolling(); await host.drain();
+ *
+ * ⚠️ **concurrency 的含义变了**：一个长跑 agent 会占住一个并发槽的**全程**。
+ * 按「同时最多跑几个 agent」来配，而不是「每秒处理几个任务」。
  */
 export function createAgentWorker(options: AgentWorkerOptions): AgentWorker {
-  const logger = options.logger ?? noopLogger;
-  const workerId = options.workerId ?? `ca-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-  const registry = options.registry ?? new MemoryRunRegistry();
-  const host =
-    options.host ??
-    new AgentRunHost({
-      registry,
-      workerId,
-      logger,
-      ...(options.eventSinks ? { eventSinks: options.eventSinks } : {}),
-    });
-
-  const shared: CompileDeps = { ...options, registry, host, workerId, logger };
-  const workers = options.specs.map((spec) => compileAgentWorker(spec, shared));
+  const workers = options.specs.map((spec) => compileAgentWorker(spec, options));
   const taskDefs = options.specs.map((spec) => deriveTaskDef(spec));
-  return { workers, taskDefs, host };
+  return { workers, taskDefs };
 }

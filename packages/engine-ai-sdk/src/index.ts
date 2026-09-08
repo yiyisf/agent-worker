@@ -51,8 +51,8 @@ export const aiSdkCapabilities: EngineCapabilities = {
   // 所有工具都是我们包装过的 tool({ execute })
   toolInterception: 'all',
   /**
-   * M1 不做引擎级挂起。异步化之后一次运行从头跑到完成，需要等人的场景直接在**工具内部 await**
-   * 更简单也更可控（见 §4.7）；引擎级的两段式审批留到 M2。
+   * M1 不做引擎级挂起。短等待直接在**工具内部 await**，长等待交给工作流的 HUMAN 任务
+   * （见 §4.7）；引擎级的两段式审批留到 M5。
    */
   suspend: 'none',
   progress: 'step',

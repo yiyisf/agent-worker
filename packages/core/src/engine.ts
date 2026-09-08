@@ -4,9 +4,9 @@
  * 契约刻意只有 3 个成员（capabilities / build / run），目标是「任何 Agent SDK 都能在几十行内适配」。
  * 引擎的唯一硬性义务：所有模型调用经 gateways.model、所有工具执行经 gateways.tools（ADR-0012）。
  *
- * ⚠️ 一次 run 从头跑到完成（ADR-0019）。没有分片、没有跨调用的状态交接 ——
- * agent 的状态自始至终在这一次 run 的内存里。等待外部（审批、慢接口）由引擎/工具在
- * run 内部 await，不交还给编排引擎。
+ * ⚠️ 一次 run 从头跑到完成（ADR-0019 / ADR-0022）。没有跨调用的状态交接 ——
+ * agent 的状态自始至终在这一次 run 的内存里，extendLease 心跳保证它不会中途换 worker。
+ * 短等待（慢接口）由工具在 run 内部 await；长等待（人工审批）交给工作流（§4.7）。
  */
 import type { AgentSpec, JsonValue } from './spec.js';
 import type { RunContext, Logger } from './context.js';
