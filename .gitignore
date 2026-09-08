@@ -6,3 +6,7 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+pnpm-lock.yaml.bak
+
+# 验证脚本的产物：含服务端地址，跑完贴回来即可，不入库
+examples/minimal-agent/verification-report.md

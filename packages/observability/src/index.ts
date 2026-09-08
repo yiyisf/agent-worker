@@ -9,8 +9,9 @@
  * - otelEventSink：span 树 agent.run → agent.slice → gen_ai.chat / tool.execute
  *   两个受管入口天然就是埋点位置 —— 不需要引擎配合，换引擎不丢埋点（ADR-0012）
  * - 从任务输入的 _traceparent 继承 trace context，traceId 回写 outputData
- * - Agent 语义指标：token / cost（按 model/tenant/spec/engine）、分片数分布、
- *   replay 命中率、工具成功率、护栏拦截率、fence 抢占次数、预算触顶次数、能力降级次数
+ * - Agent 语义指标：token / cost（按 model/tenant/spec/engine）、运行时长分布、
+ *   工具成功率、护栏拦截率、worker 崩溃导致的重新分配次数与崩溃时已花费的成本、并发槽占用率、
+ *   预算触顶次数、能力降级次数
  * - taskLogSink：经官方 getTaskContext()?.addLog() 写进度，供 Conductor UI 观察
  */
 export {};

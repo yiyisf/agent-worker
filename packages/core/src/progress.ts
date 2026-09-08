@@ -1,45 +1,91 @@
 /**
- * 进展反馈，见 docs/architecture.md §10.4 与 ADR-0018。占位：仅声明契约。
+ * 进展反馈，见 docs/architecture.md §10.4 与 ADR-0018。
  *
  * ⚠️ 这是**进展**，不是执行过程的实时输出流。三者通道不同：
  *   实时输出（token delta / 工具入参出参）→ StreamSink，高频无界
  *   进展（到第几步、在做什么、累计成本）→ 本模块，低频有界
  *   最终结果                              → outputData，一次
- * 把 token 流写进 task log 会瞬间打爆服务端，且不是编排引擎该消费的东西。
+ * 把 token 流写进 task log 会瞬间打爆服务端，且不是编排引擎该消费的东西 ——
+ * 编排引擎要的是「它还活着、走到哪了」，不是「它说了什么」。
+ *
+ * ⚠️ extendLease 模式下 outputData 只在任务结束时写一次，所以运行**途中**要看见进展
+ * 只能靠 Task Log 通道（ADR-0022）。这里只做与宿主无关的节流与聚合。
  */
 
 export interface ProgressReport {
-  /** 语义化阶段名，由引擎适配器映射，如 'planning' | 'tool:lookupPolicy' | 'finalizing' */
+  /** 语义化阶段名，如 'model' | 'tool:lookupOrder' | 'done' */
   phase: string;
   /** 已完成的受管调用数 */
   step: number;
   /** 若可预知（plan-execute 类引擎）才有 */
   totalSteps?: number;
   usage: { tokens: number; costUsd: number };
-  sliceIndex: number;
   updatedAt: number;
 }
 
-/**
- * 写入策略由 Conductor 服务端约束反推（v3.21.21 源码核实，见 ADR-0018）：
- * - taskExecLogSizeLimit 默认 10 → 单次 addLog 调用超过 10 条会被静默截断
- * - NoopIndexDAO（conductor.indexing.enabled=false）→ 日志被静默丢弃
- * - asyncIndexingEnabled 默认 false → 索引写在请求路径上，写太频拖慢服务端
- */
 export interface ProgressOptions {
-  /** 节流窗口，默认 15_000；phase 变化时立即写一次（leading edge），两者取或 */
+  /** 节流窗口，默认 15_000；phase 变化时立即放行（leading edge），两者取或 */
   intervalMs?: number;
-  /** 单次 addLog 调用的条数上限，默认 10（不可调大 —— 服务端会静默截断） */
-  maxLogsPerCall?: number;
-  /** 单个 run 的 task log 总量上限，默认 200；超限后只写阶段变化 */
-  maxLogsPerRun?: number;
-  /** 单条日志截断长度，默认 512 */
-  maxLogChars?: number;
+  /** 单个 run 的上报总量上限，默认 200；超限后只放行阶段变化 */
+  maxReportsPerRun?: number;
 }
 
 export interface ProgressReporter {
-  /** 由受管入口与分片边界调用；内部节流合并，异步 fire-and-forget，失败不影响主流程 */
+  /** 由受管入口调用；内部节流合并 */
   report(r: ProgressReport): void;
-  /** 分片交还时取当前快照，写进 outputData.progress（权威通道，零额外请求） */
+  /** 取当前快照，写进 outputData.progress（权威通道，零额外请求） */
   snapshot(): ProgressReport | undefined;
+  /** 强制吐出被节流压住的最后一条 */
+  flush(): void;
+}
+
+export const DEFAULT_PROGRESS_INTERVAL_MS = 15_000;
+export const DEFAULT_MAX_REPORTS_PER_RUN = 200;
+
+/**
+ * 节流器：窗口内多次进展合并成最后一条，phase 变化则立即放行。
+ *
+ * 总量上限之后只放行阶段变化 —— 一个跑很久的 Agent 不该把 task log 刷满，
+ * 但「它换阶段了」这种信息始终值得留下。
+ */
+export function createThrottledReporter(
+  emit: (r: ProgressReport) => void,
+  opts: ProgressOptions = {},
+  now: () => number = Date.now,
+): ProgressReporter {
+  const intervalMs = opts.intervalMs ?? DEFAULT_PROGRESS_INTERVAL_MS;
+  const maxReports = opts.maxReportsPerRun ?? DEFAULT_MAX_REPORTS_PER_RUN;
+
+  let last: ProgressReport | undefined;
+  let pending: ProgressReport | undefined;
+  let lastEmitAt = -Infinity;
+  let lastPhase: string | undefined;
+  let emitted = 0;
+
+  const doEmit = (r: ProgressReport): void => {
+    emit(r);
+    emitted += 1;
+    lastEmitAt = now();
+    lastPhase = r.phase;
+    pending = undefined;
+  };
+
+  return {
+    report(r: ProgressReport): void {
+      last = r;
+      const phaseChanged = r.phase !== lastPhase;
+      if (emitted >= maxReports && !phaseChanged) {
+        pending = r;
+        return;
+      }
+      if (phaseChanged || now() - lastEmitAt >= intervalMs) doEmit(r);
+      else pending = r;
+    },
+    snapshot(): ProgressReport | undefined {
+      return last;
+    },
+    flush(): void {
+      if (pending) doEmit(pending);
+    },
+  };
 }

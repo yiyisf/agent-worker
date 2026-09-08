@@ -1,5 +1,9 @@
 # ADR-0003：以 Journaled Replay 作为恢复机制
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> Journaled Replay 的存在前提是分片模型 —— 分片删除后，一次运行内部不存在「重放」这回事，
+> journal 的短路失去了作用点。步级 journal 作为可选增强留给 M2，且要先有实测数据。
+
 - 状态：Accepted
 - 日期：2026-09-05
 

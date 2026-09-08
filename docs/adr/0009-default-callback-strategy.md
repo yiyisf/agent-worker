@@ -1,5 +1,11 @@
 # ADR-0009：默认租约策略选 `callback`
 
+> ⚠️ **Superseded by [ADR-0022](0022-lease-extend-worker-affinity.md)（v0.8）。**
+> 「默认 callback」这个决定是错的，理由本身也是错的：callback 每次交还都把任务
+> `postpone` 写回队列，下一次谁 `pop` 到就是谁 —— **worker 亲和随之丢失**。
+> 而 `poll` 结尾的 `ack` 会把任务从队列删除，extendLease 期间它一直不在队列里，
+> 天然保证同一 worker。改用 extendLease。
+
 - 状态：Accepted（改写 [ADR-0007](0007-lease-strategies-revised.md) 的默认值，不改其策略集合）
 - 日期：2026-09-05
 

@@ -67,3 +67,31 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，分片之间�
 - `outputData.progress` 只在分片边界更新：`lease-extend` 策略下整个运行只更新一次。
   → 这是选 `callback` 作默认策略的又一个理由（ADR-0009）。
 - 多写一份 progress 进 journal。相对 journal 本身的体量可忽略。
+
+---
+
+## 实装记录（2026-09-05，M1.4）
+
+**一处对本 ADR 的偏离，实现时改得更好：**
+
+本 ADR 原文说「进展**同时写 journal**，新 taskId 的第一条 log 输出续接摘要」。
+实装时改为 **从已有 journal 条目推导**（`progressFromJournal`）：
+已完成的受管调用数与累计用量本来就在 `model` / `tool.result` / `slice` 条目里，
+再单独写一份纯属重复，白白加重 §15.3 第 3 条关心的写放大。
+续接摘要的效果不变，但每次上报少一次 journal 写。
+
+**其余按 ADR 落地：**
+
+| 约束 | 实现 |
+|---|---|
+| 15s 节流 + phase 变化立即写 | `createThrottledReporter`（core，纯逻辑，可用假时钟测） |
+| 单次 addLog ≤ 10 条 | `drain()` 按 10 条一批发；超出会被服务端 `logs.stream().limit(10)` 静默截断 |
+| 单 run ≤ 200 条 | 超限后**只放行阶段变化** —— 长跑的 Agent 不该刷满 task log，但换阶段始终值得留下 |
+| 截断 512 字符、不含 payload 与密钥 | `formatProgressLine` 输出一行结构化文本 |
+| 异步 fire-and-forget，失败只记本地日志 | `drain()` 捕获异常并 warn，不影响主流程 |
+| 启动自检、不可用则降级并告警一次 | `taskLogAvailable: false` → 关闭通道二、warn 一次；权威通道不受影响 |
+| 权威通道 outputData.progress | 由 `toTaskResult` 随分片交还一起写出，零额外请求 |
+
+**测试**（16 + 4 个）覆盖：窗口内合并、phase 变化立即放行、总量上限后只放阶段变化、
+批次不超 10 条、写失败不影响主流程、索引未启用时一条都不写且只告警一次、
+跨 taskId 重试补出续接摘要、以及 worker 层两条通道的端到端。

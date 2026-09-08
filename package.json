@@ -12,6 +12,20 @@
     "typecheck": "tsc -b",
     "test": "vitest run",
     "lint": "eslint .",
-    "docs:check-mermaid": "node scripts/check-mermaid.mjs"
+    "docs:check-mermaid": "node scripts/check-mermaid.mjs",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4",
+    "@types/node": "^22.10.0",
+    "tsup": "^8.5.0"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "allowedVersions": {
+        "@io-orkes/conductor-javascript>zod": "4"
+      }
+    }
   }
 }

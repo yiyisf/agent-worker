@@ -3,10 +3,7 @@
  *
  * 传输层类型（Task / TaskResult / ConductorWorker / TaskManager）一律来自
  * `@io-orkes/conductor-javascript`，本项目不再自定义。这里只放桥接层自己的类型。
- *
- * 占位：仅声明契约。
  */
-import type { LeaseStrategy, ResumePolicy } from '@ca/core';
 
 /** 官方 SDK 的连接配置约定（env 优先，与其他 Conductor 客户端一致） */
 export interface ConnectionOptions {
@@ -23,8 +20,6 @@ export interface AgentWorkerBinding {
   domain?: string;
   concurrency: number;
   pollIntervalMs: number;
-  leaseStrategy: LeaseStrategy;
-  resumePolicy: ResumePolicy;
-  /** callback / hybrid 策略下单次交还的等待秒数上限，受 timeoutSeconds 约束 */
-  maxCallbackAfterSeconds?: number;
+  /** 心跳节奏：每次交还任务时请求的回调间隔 */
+  callbackAfterSeconds: number;
 }

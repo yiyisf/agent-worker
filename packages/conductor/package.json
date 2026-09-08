@@ -13,9 +13,14 @@
     "build": "tsup src/index.ts --format esm,cjs --dts"
   },
   "peerDependencies": {
-    "@io-orkes/conductor-javascript": ">=3.0.0"
+    "@io-orkes/conductor-javascript": ">=4.0.0"
   },
   "dependencies": {
     "@ca/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@ca/testing": "workspace:*",
+    "@ca/memory": "workspace:*",
+    "ioredis": "^5.4.1"
   }
 }

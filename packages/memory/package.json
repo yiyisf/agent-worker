@@ -1,13 +1,22 @@
 {
   "name": "@ca/memory",
   "version": "0.0.0",
-  "description": "StateStore / BlobStore / MemoryStore 接口与实现",
+  "description": "BlobStore / MemoryStore 接口与实现（可选，仅用于结果外置）",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "sideEffects": false,
   "scripts": {
     "build": "tsup src/index.ts --format esm,cjs --dts"
+  },
+  "dependencies": {
+    "ioredis": "^6.0.0",
+    "@ca/core": "workspace:*"
+  },
+  "devDependencies": {
+    "@ca/testing": "workspace:*"
   }
 }

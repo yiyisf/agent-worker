@@ -5,7 +5,7 @@
 
 ## 背景
 
-`@io-orkes/conductor-javascript` v3.x 起内置了完整的 **durable agent 层**（`/agents` 子路径导出）：
+`@io-orkes/conductor-javascript`（实际发布版 4.0.0）内置了完整的 **durable agent 层**（`/agents` 子路径导出）：
 `Agent` / `AgentRuntime`（`run`/`start`/`stream`/`deploy`/`serve`/`plan`）、本地工具 `tool()`、
 服务端工具 `httpTool`/`mcpTool`/`apiTool`/`agentTool`/`humanTool`、guardrails、handoff、memory、
 liveness、streaming + HITL、结构化输出、`plan_execute` 与静态 Plan builder、调度 API，

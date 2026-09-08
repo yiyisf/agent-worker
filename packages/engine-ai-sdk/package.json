@@ -17,5 +17,10 @@
   },
   "peerDependencies": {
     "ai": "^7.0.0"
+  },
+  "devDependencies": {
+    "ai": "^7",
+    "zod": "^4",
+    "@ca/testing": "workspace:*"
   }
 }

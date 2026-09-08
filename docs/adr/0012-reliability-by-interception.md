@@ -1,5 +1,9 @@
 # ADR-0012：可靠性通过拦截两个入口实现，而非拥有循环
 
+> ℹ️ **Amended by [ADR-0019](0019-async-agent-execution.md)（v0.7）。**
+> 两个受管入口仍是可靠性的唯一作用点，但它们现在做的是
+> **预算闸门、超时闸门、幂等键注入、事件**，不再做 journal 短路。
+
 - 状态：Accepted（`suspend` 被 [ADR-0014](0014-native-approval-only-suspension.md) 修订；
   `interceptModel` / `interceptTools` 被 v0.6 换成分级，见下方补充）
 - 日期：2026-09-05

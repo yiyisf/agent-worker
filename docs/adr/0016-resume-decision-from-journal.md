@@ -1,5 +1,9 @@
 # ADR-0016：用自己的 journal 终态区分「崩溃」与「业务失败」
 
+> ⚠️ **Superseded by [ADR-0019](0019-async-agent-execution.md) / [ADR-0021](0021-orphan-run-policy.md)（v0.7）。**
+> journal 删除后，「崩溃 vs 业务失败」改由运行注册表的**心跳**区分：
+> 心跳过期 = 宿主没了（接管重跑，不消耗 `retryCount`）；写入终态 = 跑完了并判定失败。
+
 - 状态：Accepted
 - 日期：2026-09-05
 
