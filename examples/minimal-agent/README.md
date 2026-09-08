@@ -6,12 +6,19 @@ M1 的端到端示例：一个订单助手 Agent 跑在 Conductor 的 SIMPLE 任
 
 ## 快速跑一遍
 
+对着**已在运行的** Conductor OSS（≥ 3.10.7）：
+
 ```bash
-docker compose -f docker-compose.yml up -d          # 只需要 Conductor（Redis 是可选的）
-pnpm --filter @ca-example/minimal-agent start        # 注册 → 起 worker → 触发一次运行
+export CONDUCTOR_SERVER_URL=http://your-conductor:8080/api
+
+pnpm --filter @ca-example/minimal-agent verify   # 一键验证，逐条 PASS/FAIL + 写出报告
+pnpm --filter @ca-example/minimal-agent start    # 或者手动跑一次看过程
 ```
 
-`docker compose down -v` 收尾。
+没有现成服务端的话，仓库带了个 compose：
+`pnpm --filter @ca-example/minimal-agent up`，收尾 `… down`。
+
+完整验证说明见 [docs/verification.md](../../docs/verification.md)。
 
 ## 它演示什么
 
@@ -20,6 +27,7 @@ pnpm --filter @ca-example/minimal-agent start        # 注册 → 起 worker →
 | `src/agent.ts` | 工具与模型用 **AI SDK 原生写法**；`AgentSpec` 是纯数据，只声明可靠性策略（ADR-0011 / ADR-0013） |
 | `src/conductor.ts` | 装配：`createAgentWorker` 编译出的 worker 直接交给官方 `TaskManager`（ADR-0006）。**没有任何外部中间件** |
 | `src/main.ts` | 跑一次并打印状态轨迹、运行时长、`pollCount` / `retryCount`、结果与 task log |
+| `src/verify.ts` | 一键验证：跑完整流程、逐条 PASS/FAIL、写出可直接贴回的报告 |
 | `src/e2e.test.ts` | 端到端断言；**没有 Conductor 就跳过而不是失败** |
 
 ## 三个刻意的设计

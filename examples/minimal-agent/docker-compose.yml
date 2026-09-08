@@ -21,6 +21,14 @@ services:
     container_name: ca-conductor
     environment:
       - CONFIG_PROP=config-postgres.properties
+      # ⚠️ 镜像里 config-postgres.properties 的连接串是**写死**的：
+      #     spring.datasource.url=jdbc:postgresql://postgresdb:5432/postgres
+      #   官方 compose 靠 `links: conductor-postgres:postgresdb` 造出那个主机名。
+      #   这里改用环境变量直接覆盖数据源 —— 不依赖镜像里那份文件的写法，跨版本更稳。
+      #   （Spring Boot 的 relaxed binding：SPRING_DATASOURCE_URL → spring.datasource.url）
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://conductor-postgres:5432/conductor
+      - SPRING_DATASOURCE_USERNAME=conductor
+      - SPRING_DATASOURCE_PASSWORD=conductor
     ports:
       - '8080:8080' # REST API + UI
     depends_on:
@@ -40,8 +48,13 @@ services:
       - POSTGRES_USER=conductor
       - POSTGRES_PASSWORD=conductor
       - POSTGRES_DB=conductor
+    # 兜底：万一上面的环境变量覆盖在某个镜像版本上不生效，这个别名让镜像里
+    # 写死的 postgresdb 主机名也能解析到
+    networks:
+      default:
+        aliases: ['postgresdb']
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U conductor']
+      test: ['CMD-SHELL', 'pg_isready -U conductor -d conductor']
       interval: 5s
       timeout: 5s
       retries: 20

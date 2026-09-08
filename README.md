@@ -193,15 +193,17 @@ redis-server --port 6380 --daemonize yes --save '' --appendonly no
 CA_TEST_REDIS_URL=redis://127.0.0.1:6380 pnpm test
 ```
 
-跑端到端（需要 docker daemon）：
+对着**已在运行的** Conductor OSS（≥ 3.10.7）做端到端验证：
 
 ```bash
-docker compose -f examples/minimal-agent/docker-compose.yml up -d
-CONDUCTOR_SERVER_URL=http://localhost:8080/api pnpm test
-pnpm --filter @ca-example/minimal-agent start   # 手动跑一次并看输出
+export CONDUCTOR_SERVER_URL=http://your-conductor:8080/api
+
+pnpm --filter @ca-example/minimal-agent verify   # 一键验证：逐条 PASS/FAIL + 写出报告
+CONDUCTOR_SERVER_URL=$CONDUCTOR_SERVER_URL pnpm test   # 或跑完整测试套件
 ```
 
-完整的验证清单与通过标准见 **[docs/verification.md](docs/verification.md)**。
+不需要 Redis、不需要 LLM key（示例默认用确定性的脚本化模型）。
+完整说明与通过标准见 **[docs/verification.md](docs/verification.md)**。
 
 ## 文档校验
 

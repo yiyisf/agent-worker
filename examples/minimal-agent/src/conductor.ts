@@ -74,11 +74,14 @@ export async function registerMetadata(): Promise<void> {
  * 以及线上 TaskDef 的 responseTimeoutSeconds 被调到 1.25 以下（官方心跳会跳过不发）。
  * 这两种情况不检查的话，线上表现都是"agent 莫名其妙超时"，很难查。
  */
-export async function runPreflight(): Promise<PreflightReport> {
+export async function runPreflight(strict = true): Promise<PreflightReport> {
   return preflight({
     taskDefs: [deriveTaskDef(orderAgentSpec)],
     source: httpPreflightSource({ serverUrl: CONDUCTOR_URL }),
     logger: console,
+    // verify 脚本传 false：负向验证时要把问题**记成一条红色检查项**，
+    // 而不是抛出去变成「脚本自己崩了」
+    strict,
   });
 }
 

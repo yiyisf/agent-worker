@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "tsx src/main.ts",
+    "verify": "tsx src/verify.ts",
     "up": "docker compose -f docker-compose.yml up -d",
     "down": "docker compose -f docker-compose.yml down -v"
   },
