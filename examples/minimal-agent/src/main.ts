@@ -9,6 +9,7 @@
 import { counters } from './agent.js';
 import {
   buildWiring,
+  runPreflight,
   getTaskLogs,
   getWorkflow,
   registerMetadata,
@@ -22,11 +23,19 @@ async function main(): Promise<void> {
   console.log('① 注册 TaskDef 与工作流定义…');
   await registerMetadata();
 
-  console.log('② 启动 worker（poll 循环由官方 TaskManager 托管）…');
+  console.log('② 启动自检（服务端版本 / TaskDef 漂移）…');
+  const report = await runPreflight();
+  console.log(
+    `   服务端 ${report.serverVersion ?? '版本未知'} · extendLease ${
+      report.extendLeaseSupported === true ? '可用' : String(report.extendLeaseSupported)
+    } · 漂移 ${report.drift.length} 项`,
+  );
+
+  console.log('③ 启动 worker（poll 循环与 extendLease 心跳都由官方 SDK 托管）…');
   const wiring = await buildWiring();
   const manager = await startPolling(wiring);
 
-  console.log('③ 触发一次运行…');
+  console.log('④ 触发一次运行…');
   const workflowId = await startRun('查一下订单 A-1001 到哪了');
   console.log('   workflowId =', workflowId);
 
@@ -43,7 +52,7 @@ async function main(): Promise<void> {
 
   const t = wf.tasks?.[0];
   const durationMs = (t?.endTime ?? 0) - (t?.startTime ?? 0);
-  console.log('④ 结果');
+  console.log('⑤ 结果');
   console.log('   status  =', wf.status);
   console.log(`   运行时长 = ${(durationMs / 1000).toFixed(1)}s（responseTimeoutSeconds = 5s）`);
   console.log(`   pollCount = ${t?.pollCount ?? '?'} / retryCount = ${t?.retryCount ?? 0}`);
@@ -55,7 +64,7 @@ async function main(): Promise<void> {
   const taskId = wf.tasks?.[0]?.taskId;
   if (taskId) {
     const logs = await getTaskLogs(taskId);
-    console.log('⑤ Conductor Task Log（extendLease 下唯一的运行中进展通道）');
+    console.log('⑥ Conductor Task Log（extendLease 下唯一的运行中进展通道）');
     if (logs.length === 0) {
       console.log('   （空 —— 该部署可能未启用 task log 索引，属预期降级，见 §10.4）');
     }

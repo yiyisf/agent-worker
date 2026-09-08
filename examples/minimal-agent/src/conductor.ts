@@ -18,8 +18,15 @@ import {
   WorkflowExecutor,
   orkesConductorClient,
 } from '@io-orkes/conductor-javascript';
-import { createAgentWorker, createCancellationWatcher, deriveTaskDef } from '@ca/conductor';
-import type { AgentWorker } from '@ca/conductor';
+import {
+  createAgentWorker,
+  createCancellationWatcher,
+  createExternalInputResolver,
+  deriveTaskDef,
+  httpPreflightSource,
+  preflight,
+} from '@ca/conductor';
+import type { AgentWorker, PreflightReport } from '@ca/conductor';
 import { TASK_TYPE, WORKFLOW_NAME, buildEngine, orderAgentSpec } from './agent.js';
 
 export const CONDUCTOR_URL = process.env.CONDUCTOR_SERVER_URL ?? 'http://localhost:8080/api';
@@ -60,6 +67,21 @@ export async function registerMetadata(): Promise<void> {
   await new WorkflowExecutor(client).registerWorkflow(true, workflowDef as never);
 }
 
+/**
+ * 启动自检（§6.8）。放在注册之后、起 worker 之前。
+ *
+ * 它挡的是两类**静默失效**：服务端 < 3.10.7（没有 extendLease，长任务必被判超时），
+ * 以及线上 TaskDef 的 responseTimeoutSeconds 被调到 1.25 以下（官方心跳会跳过不发）。
+ * 这两种情况不检查的话，线上表现都是"agent 莫名其妙超时"，很难查。
+ */
+export async function runPreflight(): Promise<PreflightReport> {
+  return preflight({
+    taskDefs: [deriveTaskDef(orderAgentSpec)],
+    source: httpPreflightSource({ serverUrl: CONDUCTOR_URL }),
+    logger: console,
+  });
+}
+
 export interface Wiring extends AgentWorker {
   close: () => Promise<void>;
 }
@@ -83,6 +105,8 @@ export async function buildWiring(): Promise<Wiring> {
     engines: [engine],
     logger: console,
     isWorkflowCancelled,
+    // 大输入（> 3072 KB）会被服务端外置，inputData 变空 —— 必须显式取回（§6.5）
+    externalInputResolver: createExternalInputResolver({ serverUrl: CONDUCTOR_URL }),
     /**
      * 进展的**运行中**通道（§10.4）。extendLease 模式下 outputData 只在结束时写一次，
      * 所以这是运行途中唯一能看见进度的地方。写失败不影响主流程。
@@ -93,6 +117,9 @@ export async function buildWiring(): Promise<Wiring> {
             addLogs: async (lines) => {
               for (const line of lines) await tasks.addTaskLog(task.taskId!, line);
             },
+            // 一次性实测：写完读回来是空的就说明该部署没启索引，自动关闭通道并告警一次。
+            // 读配置是靠不住的 —— /admin/config 返回的是 System.getProperties()。
+            readLogs: () => tasks.getTaskLogs(task.taskId!) as Promise<unknown[]>,
           }
         : undefined,
     progress: { intervalMs: 2_000 },

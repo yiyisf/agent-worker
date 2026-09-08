@@ -10,7 +10,7 @@
 - **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **外部依赖**：**零**。不需要 Redis 或任何中间件 —— agent 状态全程在 worker 进程内
 - **服务端要求**：Conductor OSS **≥ 3.10.7**（`TaskResult.extendLease` 自该版本引入）
-- **当前状态**：**M1 代码完成**（v0.8 设计）。54 个离线测试通过；端到端验证待真机执行，见 [docs/verification.md](docs/verification.md)
+- **当前状态**：**M1 代码完成**（v0.8 设计）。79 个离线测试通过；端到端验证待真机执行，见 [docs/verification.md](docs/verification.md)
 
 ## 这个 SDK 做什么、不做什么
 
@@ -125,6 +125,19 @@ poll 成功后任务就不在队列里了，别的 worker 根本看不到它。`
 3. **`inputData` 在一个 task 实例内是冻结的** —— 外部信号无法在运行途中送达；
    长等待（人工审批）应该交给工作流的 HUMAN 任务，而不是让 agent 自己等。
 
+前两条不检查的话，线上表现都是「agent 莫名其妙超时」，很难查。所以有一个
+**启动自检**（[§6.8](docs/architecture.md#68-启动自检preflight)）把它们挡在启动阶段：
+
+```ts
+await preflight({ taskDefs, source: httpPreflightSource({ serverUrl }), logger: console });
+// 服务端 < 3.10.7 → 拒绝启动
+// 线上 responseTimeoutSeconds < 1.25 或 retryCount = 0 → 拒绝启动
+// 其余 TaskDef 漂移 → 告警
+```
+
+它挡的最要紧的一类是「**代码是对的，线上定义被人改坏了**」——
+`LeaseTracker` 读的是运行态任务上的快照值，线上被调小心跳就静默失效了。
+
 ## 从这里开始
 
 | 文档 | 内容 |
@@ -169,7 +182,7 @@ M1 只做一个引擎。**多引擎推迟到 M3**：先用一个真实引擎把�
 ```bash
 pnpm install
 pnpm build          # 包之间按拓扑顺序构建；子包 typecheck 依赖 core 的构建产物
-pnpm test           # 57 个测试（无 Conductor 时自动跳过端到端用例）
+pnpm test           # 83 个测试（无 Conductor 时自动跳过端到端用例）
 ```
 
 **SDK 本身不需要 Redis。** 只有可选的 `BlobStore`（结果超出 outputData 预算时外置）

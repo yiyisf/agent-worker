@@ -50,7 +50,7 @@ pnpm build
 CONDUCTOR_SERVER_URL=http://localhost:8080/api pnpm test
 ```
 
-**预期**：`57 passed`（其中 3 个 e2e 用例此前会被跳过，现在应当执行）。
+**预期**：`83 passed`（其中 4 个 e2e 用例此前会被跳过，现在应当执行）。
 
 ---
 
@@ -64,12 +64,14 @@ pnpm --filter @ca-example/minimal-agent start
 
 ```
 ① 注册 TaskDef 与工作流定义…
-② 启动 worker（poll 循环由官方 TaskManager 托管）…
+② 启动自检（服务端版本 / TaskDef 漂移）…
+   服务端 3.22.3 · extendLease 可用 · 漂移 0 项
+③ 启动 worker（poll 循环与 extendLease 心跳都由官方 SDK 托管）…
    [order_assistant] extendLease 心跳：每 4s 一次（responseTimeoutSeconds=5），由官方 LeaseTracker 托管
-③ 触发一次运行…
+④ 触发一次运行…
    workflowId = <uuid>
    任务状态轨迹： IN_PROGRESS(poll=1) → IN_PROGRESS(poll=1) → … → COMPLETED(poll=1)
-④ 结果
+⑤ 结果
    status  = COMPLETED
    运行时长 = 12.3s（responseTimeoutSeconds = 5s）
    pollCount = 1 / retryCount = 0
@@ -82,7 +84,7 @@ pnpm --filter @ca-example/minimal-agent start
    真实调用：模型 2 次 / 工具 1 次
    ↑ 运行时长远超 responseTimeoutSeconds 却没被判超时 = extendLease 心跳生效；
      pollCount=1 且 retryCount=0 = 从头到尾同一个 worker，没被重新分配。
-⑤ Conductor Task Log（extendLease 下唯一的运行中进展通道）
+⑥ Conductor Task Log（extendLease 下唯一的运行中进展通道）
    · [1] model · 144 tok / $0.0007
    · [3] done · 360 tok / $0.0018
 ```
@@ -91,16 +93,17 @@ pnpm --filter @ca-example/minimal-agent start
 
 | # | 看什么 | 通过标准 | 对应设计 |
 |---|---|---|---|
+| 0 | ② 打印「extendLease 可用 · 漂移 0 项」 | 启动自检通过。服务端 < 3.10.7 或线上 TaskDef 被改坏时这里就会直接报错退出 | §6.8 |
 | 1 | **运行时长 > 5 秒，但 status 是 COMPLETED 不是 TIMED_OUT** | **最关键的一条**：示例的 `responseTimeoutSeconds` 是 5 秒而模型第一步要跑 12 秒。没有 extendLease 心跳的话任务必然被判超时 —— 能跑完本身就是心跳生效的证据 | §5.2、ADR-0022 |
 | 2 | **`pollCount = 1` 且 `retryCount = 0`** | 任务从头到尾没回过队列、没被重新分配 = 同一个 worker 执行到底 | §2.2、§5.3 |
 | 3 | 状态轨迹里**只有 `IN_PROGRESS`**，没有 `SCHEDULED` | extendLease 不把任务写回队列（callback 模式才会出现两者交替） | §2.2 |
 | 4 | **真实调用：模型 2 次 / 工具 1 次** | 一次执行只跑一遍 | §5.1 |
 | 5 | `output.taskId` == 任务的 `taskId` | 运行标识就是 taskId | ADR-0020 |
 | 6 | `output.usage.costUsd > 0` | 成本被记账（示例配了 pricing） | §4.3 |
-| 7 | ⑤ 有日志行 | 运行中的进展通道通了 | §10.4 |
+| 7 | ⑥ 有日志行 | 运行中的进展通道通了 | §10.4 |
 
-> ⑤ **为空也可能是对的**：若该部署未启用 task log 索引（`NoopIndexDAO`），
-> 我们的自检会关闭这条通道并告警一次，程序会打印
+> ⑥ **为空也可能是对的**：若该部署未启用 task log 索引（`NoopIndexDAO`），
+> 我们会在第一次写入后**读回来实测**，发现是空的就关闭这条通道并告警一次，程序会打印
 > 「（空 —— 该部署可能未启用 task log 索引，属预期降级）」，
 > 而终态的 `output.progress` 仍然有值。这正是 §10.4 设计的降级行为。
 >
@@ -148,13 +151,32 @@ UI 上能看到 `Retry Count = 1`，且 Task 列表里有两条记录（原来�
 
 ---
 
-## 6. 心跳配置的负向验证（可选，5 分钟）
+## 6. 启动自检的负向验证（可选，10 分钟）
 
-证明「配置错了会在启动时被拒绝，而不是线上超时才发现」：
+证明「配置错了会在启动时被拒绝，而不是线上超时才发现」。三个场景：
 
-把 `examples/minimal-agent/src/agent.ts` 里的 `responseTimeoutSeconds` 改成 `1`，再启动。
+**6.1 本地取值错误** —— 把 `examples/minimal-agent/src/agent.ts` 里的
+`responseTimeoutSeconds` 改成 `1`，再启动。
 
 **通过标准**：启动即报错，信息里说明官方 `LeaseTracker` 在间隔 < 1000ms 时会跳过心跳。
+
+**6.2 线上 TaskDef 被改坏** —— 保持代码不变，直接改线上定义：
+
+```bash
+curl -s http://localhost:8080/api/metadata/taskdefs/agent_order_assistant \
+  | jq '.responseTimeoutSeconds = 1' \
+  | curl -s -X PUT http://localhost:8080/api/metadata/taskdefs \
+      -H 'content-type: application/json' -d @-
+pnpm --filter @ca-example/minimal-agent start
+```
+
+**通过标准**：`②` 阶段直接报错退出，信息里包含「静默跳过心跳」。
+这是最要紧的一条 —— **代码是对的，线上被人改坏了**，不检查的话表现就是"agent 莫名超时"。
+（改回去：重跑一次 `registerMetadata` 即可，它是覆盖注册。）
+
+**6.3 服务端版本不够** —— 若手上有 < 3.10.7 的实例，指过去启动。
+
+**通过标准**：报错说明需要 ≥ 3.10.7，并解释为什么（没有 extendLease，长任务必被判超时）。
 
 ---
 
@@ -185,7 +207,8 @@ docker compose -f examples/minimal-agent/docker-compose.yml down -v
 | 现象 | 多半是 |
 |---|---|
 | e2e 被跳过 | Conductor 连不上；检查 `/health` |
-| 任务变成 `TIMED_OUT` | 心跳没发出去。查 `responseTimeoutSeconds` 是否 < 1.25，以及服务端是否 ≥ 3.10.7 |
+| 任务变成 `TIMED_OUT` | 心跳没发出去。**先看 ② 的自检输出** —— 它就是为这个场景设计的。若自检说 OK 但仍超时，查 worker 日志里有没有心跳失败 |
+| 启动就报错 | 自检拦下了配置问题，报错信息里写了是哪一条与为什么。见 §6 |
 | 状态轨迹里出现 `SCHEDULED` | `leaseExtendEnabled` 没生效，走了 callback 路径 |
 | `pollCount > 1` 或 `retryCount > 0` | 发生过重新分配 —— worker 崩过或心跳断过，查 worker 日志 |
 | 真实模型调用次数 > 2 | 任务被跑了不止一遍，检查上一条 |

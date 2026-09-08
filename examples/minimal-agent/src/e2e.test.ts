@@ -16,6 +16,7 @@ import { TASK_TYPE, counters } from './agent.js';
 import {
   CONDUCTOR_URL,
   buildWiring,
+  runPreflight,
   getTaskLogs,
   getWorkflow,
   registerMetadata,
@@ -70,6 +71,7 @@ async function runToCompletion(question: string, timeoutMs = 120_000) {
 describe.skipIf(!live)('minimal-agent 端到端（需要 Conductor）', () => {
   beforeAll(async () => {
     await registerMetadata();
+    await runPreflight();
     wiring = await buildWiring();
     manager = await startPolling(wiring);
   }, 60_000);
@@ -132,6 +134,16 @@ describe.skipIf(!live)('minimal-agent 端到端（需要 Conductor）', () => {
       expect(l.log!.length).toBeLessThanOrEqual(512);
     }
   }, 180_000);
+
+  it('启动自检通过：服务端支持 extendLease，线上 TaskDef 与本地一致', async () => {
+    const report = await runPreflight();
+    expect(report.ok).toBe(true);
+    expect(report.problems).toEqual([]);
+    // 3.10.7 以下不支持 extendLease，本 SDK 依赖它
+    expect(report.extendLeaseSupported).not.toBe(false);
+    // registerMetadata 刚跑过，不该有漂移
+    expect(report.drift).toEqual([]);
+  }, 30_000);
 
   it('TaskDef 已按注册期规则写入', async () => {
     const res = await fetch(`${CONDUCTOR_URL}/metadata/taskdefs/${TASK_TYPE}`);

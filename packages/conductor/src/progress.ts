@@ -33,16 +33,27 @@ export const TASK_LOG_LIMITS = {
 } as const;
 
 export interface TaskLogSink {
-  /** 通常是官方 SDK 的 getTaskContext()?.addLog；一次最多 10 条 */
+  /** 通常是官方 SDK 的 TaskClient.addTaskLog；一次最多 10 条 */
   addLogs(lines: string[]): Promise<void> | void;
+  /**
+   * 可选：把日志读回来（`TaskClient.getTaskLogs`）。
+   *
+   * 提供了它，reporter 会在**第一次成功写入之后**做一次实测：读回来是空的
+   * 就说明这个部署根本不存 task log（`conductor.indexing.enabled=false` →
+   * `NoopIndexDAO` 静默丢弃），于是自动关闭本通道并**告警一次**。
+   *
+   * 为什么要实测而不是读配置：`/admin/config` 返回的是 `System.getProperties()`，
+   * 而 `conductor.indexing.enabled` 通常来自 `application.properties` 或环境变量 ——
+   * 那里读不到。只有写一条再读回来才是可靠的。
+   */
+  readLogs?(): Promise<unknown[]>;
 }
 
 export interface ConductorProgressOptions extends ProgressOptions {
   logger?: Logger;
   /**
-   * 启动自检：探测部署是否真的会保存 task log。
-   * conductor.indexing.enabled=false 时服务端用 NoopIndexDAO，**日志被静默丢弃** ——
-   * 返回 false 则自动关闭通道二并告警一次，不能让用户以为写了、其实什么都没有。
+   * 显式开关。`false` 直接关闭本通道（比如你已经知道部署没启索引）；
+   * 不传则由 `TaskLogSink.readLogs` 的一次性实测决定（没提供 readLogs 就一直开着）。
    */
   taskLogAvailable?: boolean;
 }
@@ -79,7 +90,7 @@ export function priorAttemptLine(prev: ProgressReport): string {
 export interface ConductorProgressReporter extends ProgressReporter {
   /** 把攒下的日志真正推给 Conductor；失败只记本地日志，不影响主流程 */
   drain(): Promise<void>;
-  /** 通道二是否可用（探测不可用时为 false） */
+  /** 本通道是否可用（显式关闭、或实测发现日志没被存下来时为 false） */
   readonly taskLogEnabled: boolean;
 }
 
@@ -93,15 +104,39 @@ export function createProgressReporter(
   now: () => number = Date.now,
 ): ConductorProgressReporter {
   const logger = opts.logger ?? noopLogger;
-  const enabled = sink !== undefined && opts.taskLogAvailable !== false;
+  let enabled = sink !== undefined && opts.taskLogAvailable !== false;
+  let verified = false;
 
   if (sink !== undefined && opts.taskLogAvailable === false) {
     // 只告警一次：这是部署配置问题，不是每次运行都要吼一遍的事
     logger.warn(
-      '部署未启用 task log 索引（conductor.indexing.enabled=false → NoopIndexDAO），' +
-        '进展的 Task Log 通道已自动关闭。outputData.progress 仍然可用，它才是权威通道。',
+      'task log 通道被显式关闭（taskLogAvailable=false）。运行途中将看不到进展，' +
+        '终态的 outputData.progress 仍然有值。',
     );
   }
+
+  /**
+   * 一次性实测：写完第一批之后读回来。空的就说明部署根本不存
+   * （conductor.indexing.enabled=false → NoopIndexDAO 静默丢弃）。
+   * 读失败**不**当作不可用 —— 网络抖动不该让通道被误关。
+   */
+  const verifyOnce = async (): Promise<void> => {
+    if (verified || !sink?.readLogs) return;
+    verified = true;
+    try {
+      const back = await sink.readLogs();
+      if (Array.isArray(back) && back.length === 0) {
+        enabled = false;
+        logger.warn(
+          '实测发现写入的 task log 没有被保存（读回来是空的）——' +
+            '该部署多半未启用索引（conductor.indexing.enabled=false → NoopIndexDAO）。' +
+            '本通道已自动关闭，运行途中将看不到进展；终态的 outputData.progress 仍然有值。',
+        );
+      }
+    } catch (err) {
+      logger.debug?.(`task log 自检读取失败，保持通道开启：${(err as Error)?.message}`);
+    }
+  };
 
   const buffer: string[] = [];
   const throttled = createThrottledReporter(
@@ -125,14 +160,17 @@ export function createProgressReporter(
       // 单次调用超过 10 条会被服务端静默截断，所以按 10 条一批发
       const batches: string[][] = [];
       while (buffer.length > 0) batches.push(buffer.splice(0, TASK_LOG_LIMITS.maxLogsPerCall));
+      let wroteSomething = false;
       for (const batch of batches) {
         try {
           await sink!.addLogs(batch);
+          wroteSomething = true;
         } catch (err) {
-          // 进展丢了不算故障 —— 权威通道是 outputData.progress
+          // 进展丢了不算故障 —— 终态的 outputData.progress 才是权威通道
           logger.warn(`写 task log 失败，已跳过 ${batch.length} 条：${(err as Error)?.message}`);
         }
       }
+      if (wroteSomething) await verifyOnce();
     },
   };
 }

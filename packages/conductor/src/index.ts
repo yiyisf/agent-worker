@@ -12,6 +12,8 @@ export * from './types.js';
 export * from './lease.js';
 export * from './taskdef.js';
 export * from './task-io.js';
+export * from './external-payload.js';
+export * from './preflight.js';
 export * from './result-mapper.js';
 export * from './cancellation.js';
 export * from './worker.js';

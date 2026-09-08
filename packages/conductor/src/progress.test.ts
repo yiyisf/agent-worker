@@ -150,3 +150,93 @@ describe('Task Log 通道（尽力而为）', () => {
     expect(r.snapshot()?.step).toBe(1);
   });
 });
+
+describe('task log 可用性的一次性实测', () => {
+  const report = (over: Partial<ProgressReport> = {}): ProgressReport => ({
+    phase: 'model',
+    step: 1,
+    usage: { tokens: 100, costUsd: 0.001 },
+    updatedAt: 0,
+    ...over,
+  });
+
+  it('写完读回来是空的 → 关闭通道并告警一次', async () => {
+    const warn = vi.fn();
+    const written: string[][] = [];
+    const r = createProgressReporter(
+      { addLogs: (lines) => void written.push(lines), readLogs: async () => [] },
+      { intervalMs: 0, logger: { debug() {}, info() {}, warn, error() {} } },
+    );
+
+    r.report(report({ phase: 'a' }));
+    await r.drain();
+    expect(written).toHaveLength(1);
+    expect(r.taskLogEnabled).toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0]![0]).toMatch(/没有被保存/);
+
+    // 关闭之后不再写，也不再重复告警
+    r.report(report({ phase: 'b' }));
+    await r.drain();
+    expect(written).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it('读回来有内容 → 通道保持开启，不告警', async () => {
+    const warn = vi.fn();
+    const r = createProgressReporter(
+      { addLogs: () => {}, readLogs: async () => [{ log: '[1] model' }] },
+      { intervalMs: 0, logger: { debug() {}, info() {}, warn, error() {} } },
+    );
+    r.report(report({ phase: 'a' }));
+    await r.drain();
+    expect(r.taskLogEnabled).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('自检读取失败 → 保持开启，不因网络抖动误关通道', async () => {
+    const warn = vi.fn();
+    const r = createProgressReporter(
+      {
+        addLogs: () => {},
+        readLogs: async () => {
+          throw new Error('ECONNRESET');
+        },
+      },
+      { intervalMs: 0, logger: { debug() {}, info() {}, warn, error() {} } },
+    );
+    r.report(report({ phase: 'a' }));
+    await r.drain();
+    expect(r.taskLogEnabled).toBe(true);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('没提供 readLogs 就不做自检 —— 探测是可选的', async () => {
+    const r = createProgressReporter({ addLogs: () => {} }, { intervalMs: 0 });
+    r.report(report({ phase: 'a' }));
+    await r.drain();
+    expect(r.taskLogEnabled).toBe(true);
+  });
+
+  it('写入全部失败时不做自检 —— 没写进去，读回来空是理所当然的', async () => {
+    const warn = vi.fn();
+    let read = 0;
+    const r = createProgressReporter(
+      {
+        addLogs: () => {
+          throw new Error('HTTP 500');
+        },
+        readLogs: async () => {
+          read += 1;
+          return [];
+        },
+      },
+      { intervalMs: 0, logger: { debug() {}, info() {}, warn, error() {} } },
+    );
+    r.report(report({ phase: 'a' }));
+    await r.drain();
+    expect(read).toBe(0);
+    expect(r.taskLogEnabled).toBe(true);
+  });
+});
+

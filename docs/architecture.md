@@ -35,7 +35,7 @@
 > v0.7 保留的结论：一次运行从头跑到完成、不切片；删除 journal / 跨分片状态 / fencing；
 > 运行标识就是 `taskId`；TaskDef 是只写不读的注册期契约。
 >
-> **实装状态**：**57 个测试**（54 通过 + 3 个端到端待真机）。
+> **实装状态**：**83 个测试**（79 通过 + 4 个端到端待真机）。
 > 端到端验证清单见 [verification.md](verification.md)。
 
 ---
@@ -768,6 +768,7 @@ assertHeartbeatViable(responseTimeoutSeconds)        // ② 启动时校验取�
 - **6.5 运行态输入输出**：见下。
 - **6.6 TaskDef 推导（注册期）**：见下。
 - **6.7 Domain 路由**：透传官方 `domain`。
+- **6.8 启动自检**：见下 —— 设计里所有「启动时拒绝 / 启动时告警」的**唯一落地点**。
 
 ### 6.5 运行态的输入与输出
 
@@ -794,6 +795,17 @@ assertHeartbeatViable(responseTimeoutSeconds)        // ② 启动时校验取�
 `resolveInput()` 遇到它而没有配 `externalInputResolver` 时**直接判终局失败** ——
 绝不静默拿着 `{}` 继续跑，那会让 agent 基于空输入烧一遍 token 并给出错误答案。
 
+`createExternalInputResolver({ serverUrl })` 是开箱即用的实现，两跳（源码核实）：
+
+```
+GET {serverUrl}/tasks/externalstoragelocation?path=…&operation=READ&payloadType=TASK_INPUT
+  → ExternalStorageLocation { uri, path }
+GET uri  → 真正的 JSON
+```
+
+第一跳带 Conductor 的鉴权头；第二跳的 `uri` 通常是带签名的直链（S3 presigned / Azure SAS），
+**不带**鉴权头。任何一跳失败都抛错，不返回空对象。
+
 **重试时上一次 attempt 的 `outputData` 由引擎原生携带**（`retry()` 里 `task.copy()`
 不重置 `outputData`），作为 `EngineRunArgs.previousAttempt` 交给 agent 做**业务判断**。
 它不是恢复机制 —— 恢复机制是重跑。
@@ -813,6 +825,43 @@ assertHeartbeatViable(responseTimeoutSeconds)        // ② 启动时校验取�
 `diffTaskDefs()` 在启动时比对线上定义与本地推导，**告警不阻塞**。
 ⚠️ 其中 `responseTimeoutSeconds` 的漂移**是要紧的**：`LeaseTracker` 读的是运行态任务上的
 快照值（调度那一刻从线上 TaskDef 复制），线上被调小到 1.25 秒以下会让心跳被静默跳过。
+
+### 6.8 启动自检（`preflight`）
+
+设计里有好几处写着「启动时拒绝」「启动时告警」。它们需要一个落地点，否则就只是文档里的
+一句话 —— 这是最容易出现「文档承诺了、代码没做」的地方。
+
+`preflight()` 检查三件事，每件都对应一个**不检查就会在线上以难懂的方式炸掉**的场景：
+
+| 检查 | 不检查会怎样 | 处置 |
+|---|---|---|
+| 服务端版本 ≥ 3.10.7 | 没有 `extendLease`，长任务在第一个 `responseTimeout` 时被判 `TIMED_OUT` —— 看起来像「agent 太慢」 | **拒绝启动** |
+| 线上 `responseTimeoutSeconds` < 1.25 | 官方 `LeaseTracker` 算出的间隔 < 1000ms，**静默跳过不发心跳**，同上 | **拒绝启动** |
+| 线上 `retryCount = 0` | worker 崩溃后任务不会被重新分配，直接失败 | **拒绝启动** |
+| 其余 TaskDef 漂移 | 行为与预期不符但不会静默失效 | 告警 |
+| 拿不到版本 / 读不到 TaskDef | 私有构建可能没有 `version` 键；有的部署关掉了 admin 端点 | 告警，**不阻塞** |
+
+```ts
+await preflight({
+  taskDefs,
+  source: httpPreflightSource({ serverUrl }),   // 也可以用自己的客户端实现 PreflightSource
+  logger: console,
+});
+```
+
+刻意做成**注入数据源的纯函数**：它不认识 HTTP 客户端，方便测试，也方便已有工程接进来。
+`strict: false` 只收集报告不抛，供灰度期使用。
+
+#### task log 的可用性只能实测，不能读配置
+
+`/admin/config` 返回的是 **`System.getProperties()`**（`ConductorProperties.getAll()` 的实现），
+而 `conductor.indexing.enabled` 通常来自 `application.properties` 或环境变量 —— 那里读不到。
+
+所以探测放在 `TaskLogSink.readLogs`：**第一次成功写入之后读回来一次**，是空的就说明这个部署
+根本不存（`NoopIndexDAO` 静默丢弃），自动关闭通道并告警一次。读取失败**不**当作不可用 ——
+网络抖动不该让通道被误关。
+
+---
 
 ---
 
@@ -1054,7 +1103,9 @@ task log 挂在 `taskId` 上。extendLease 期间 `taskId` 不变，所以一次
 | 单元 | 脚本化模型 + 假工具（**不需要装任何 Agent SDK**） |
 | **execute 契约** | `leaseExtendEnabled` 恒开 / 长任务不被打断 / 失败按可重试性分类 / `wallClockMs` 超时 / 工作流终止即中止 |
 | **心跳配置校验** | `responseTimeoutSeconds < 1.25` 启动即拒绝（官方会静默跳过心跳）；服务端 < 3.10.7 拒绝 |
-| 运行态 I/O | `inputData` 原样透传 / 重试拿得到上次 `outputData` / 外置输入不静默变空 |
+| 运行态 I/O | `inputData` 原样透传 / 重试拿得到上次 `outputData` / 外置输入不静默变空 / 两跳取回的鉴权边界 |
+| **启动自检** | 服务端 < 3.10.7 拒绝 / 线上 `responseTimeoutSeconds` < 1.25 拒绝 / `retryCount = 0` 拒绝 / 拿不到版本只告警不阻塞 |
+| **task log 实测探测** | 写完读回来是空的→关通道并告警一次 / 读取失败不误关 / 写入全失败时不做自检 |
 | Spec | 合并语义快照测试；effective spec 的黄金文件 |
 | 进展 | 断言节流生效、单次 `addLog` ≤ 10 条、task log 索引关闭时自动降级且只告警一次（§10.4） |
 | 集成 | docker-compose 起真实 Conductor OSS；**不需要 Redis**；没有 Conductor 就**跳过而不是失败** |
@@ -1113,8 +1164,8 @@ task log 挂在 `taskId` 上。extendLease 期间 `taskId` 不变，所以一次
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1** 最小可用 ✅ 代码完成 | extendLease 执行模型 · 受管入口与预算/超时 · engine-ai-sdk 适配 · 运行态 I/O · 进展反馈 · minimal-agent 示例 | 54 个离线测试通过；3 个端到端用例待真机执行（[verification.md](verification.md)） |
-| **M2** 可靠性加固 | worker 崩溃注入与重新分配验证 · 大输入取回（`externalInputResolver`）· 长任务压测（心跳在并发槽占满时的表现）· checkpoint / journal 的取舍决策 | 崩溃重分配测试全绿；量出「崩溃时已花费的成本」再决定要不要加 checkpoint |
+| **M1** 最小可用 ✅ 代码完成 | extendLease 执行模型 · 受管入口与预算/超时 · engine-ai-sdk 适配 · 运行态 I/O · **启动自检与大输入取回** · 进展反馈 · minimal-agent 示例 | 79 个离线测试通过；4 个端到端用例待真机执行（[verification.md](verification.md)） |
+| **M2** 可靠性加固 | worker 崩溃注入与重新分配验证 · 长任务压测（心跳在并发槽占满时的表现）· 并发槽容量模型 · checkpoint 的取舍决策 | 崩溃重分配测试全绿；量出「崩溃时已花费的成本」与「P95 运行时长」再决定 |
 | **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效 |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
 | **M5** 生态与交互 | 长等待编排模式（agent 返回 `awaiting` + HUMAN 任务）、引擎级两段式审批、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
