@@ -1,0 +1,54 @@
+name: contract-nightly
+
+# 测试环境 Conductor 在内网，只能由内网 self-hosted runner 访问。
+# 本工作流只由定时任务和手动触发，不响应 pull_request，避免不受信任的代码在内网 runner 上执行。
+on:
+  schedule:
+    - cron: '0 18 * * *' # 北京时间每天 02:00
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  contract:
+    runs-on: [self-hosted, cas-intranet]
+    environment: conductor-test
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: 契约验证
+        run: pnpm verify:contract
+        env:
+          CONDUCTOR_URL: ${{ vars.CONDUCTOR_URL }}
+          CONDUCTOR_TOKEN: ${{ secrets.CONDUCTOR_TOKEN }}
+          OWNER_EMAIL: ${{ vars.CAS_OWNER_EMAIL }}
+      - name: 写入运行摘要
+        if: always()
+        run: cat tools/contract-verify/report/*.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: contract-report
+          path: tools/contract-verify/report/
+          retention-days: 30
+      - name: 失败时建 issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const run = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `契约测试失败 ${new Date().toISOString().slice(0, 10)}`,
+              body: `每晚契约测试失败，服务端行为可能发生变化。\n\n运行记录：${run}\n\n请对照报告与 docs/architecture.md §2.3 检查保活、重试、payload 与 nameCn 相关结论，并评估对 SDK 的影响。`,
+              labels: ['risk:contract', 'type:bug'],
+            });

@@ -1,0 +1,9 @@
+# 默认维护者；团队成员确定后按包拆分
+*                                   @yiyisf
+
+# 保活、上报、fencing、信封等高风险路径（在分支保护中配合“需要 CODEOWNERS 批准”）
+/packages/core/src/                 @yiyisf
+/packages/conductor/src/            @yiyisf
+/tools/contract-verify/             @yiyisf
+/docs/adr/                          @yiyisf
+/.github/                           @yiyisf

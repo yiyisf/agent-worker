@@ -1,0 +1,21 @@
+name: 功能
+description: 设计文档中的一项能力或新需求
+labels: ['type:feat']
+body:
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 所属模块
+      options: ['@ca/core 契约与可靠性内核', '@ca/conductor 桥接层', '引擎适配（engine-*）', '存储 / 可观测 / CLI', '横切 / 工具链']
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: 要做什么
+      description: 对应设计文档的哪一节
+    validations: { required: true }
+  - type: textarea
+    id: done
+    attributes:
+      label: 验收标准
+    validations: { required: true }

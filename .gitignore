@@ -1,7 +1,10 @@
 node_modules/
 dist/
 coverage/
+report/
+.turbo/
 *.tsbuildinfo
+*.log
 .env
 .env.*
 !.env.example

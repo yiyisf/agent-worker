@@ -1,0 +1,20 @@
+name: 缺陷
+description: 行为与设计或预期不符
+labels: ['type:bug']
+body:
+  - type: textarea
+    id: actual
+    attributes: { label: 现象 }
+    validations: { required: true }
+  - type: textarea
+    id: expected
+    attributes: { label: 预期 }
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 涉及服务端行为时附上 taskId / workflowId 与 contract-verify 报告
+  - type: input
+    id: version
+    attributes: { label: 版本, placeholder: '@ca/conductor 0.1.0-alpha.0' }
