@@ -1,0 +1,14 @@
+name: 调研 / 待确认
+description: 需要实测或决策的事项
+labels: ['type:spike']
+body:
+  - type: textarea
+    id: question
+    attributes: { label: 要回答的问题 }
+    validations: { required: true }
+  - type: textarea
+    id: approach
+    attributes: { label: 验证方法 }
+  - type: textarea
+    id: impact
+    attributes: { label: 结论会影响哪些设计 }

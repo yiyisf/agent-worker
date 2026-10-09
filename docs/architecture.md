@@ -1,7 +1,22 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
-> 状态：Draft v0.6 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x
+> 状态：Draft v0.7 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x（目标部署：3.21.21 定制版）
 > 上游 Agent SDK 基线：**`ai@7.0.93`**（v0.4–v0.5 的所有 AI SDK 结论均基于 v7 主干核实）
+> 官方 Conductor SDK：**`@io-orkes/conductor-javascript@4.0.0`**（锁定）
+>
+> **v0.7 变更：与 Claude Projects 版设计（`ca-worker`）合并**
+> 1. **契约实测纳入设计**（§2.3，[ADR-0019](adr/0019-contract-verified-server-behavior.md)）：
+>    `tools/contract-verify` 迁入本仓库并每晚复核；源码阅读与实测冲突时以实测为准。
+> 2. **统一出入参信封**（§6.8，[ADR-0020](adr/0020-io-envelope.md)）：取代 v0.6 的 `ok:false` 约定。
+> 3. **HITL 分两级**（§4.7，[ADR-0021](adr/0021-two-level-hitl.md)）：任务级 `outcome` 优先，工具级原生审批保留。
+> 4. **上报前归属检查、本地体积校验**（§6.2，[ADR-0022](adr/0022-ownership-check-and-local-verification.md)）：
+>    实测发现迟到的 `COMPLETED` 与 10MB output 都会返回 HTTP 200。
+> 5. **定制必填字段 `nameCn`**（§6.9，[ADR-0023](adr/0023-custom-name-cn-and-metadata-rest.md)）：元数据注册改走自有 REST。
+> 6. **分片内保活**（§5.3，[ADR-0024](adr/0024-intra-slice-keepalive.md)）：补上 `callback` 模式下长调用会超时的缺口。
+> 7. **一个任务一个 agent**（§1.1，[ADR-0025](adr/0025-single-agent-per-task.md)）。
+>
+> Projects 版的协作式 `Agent.run(input, ctx)`、自建工具写法 `defineTool`、以 `retryCount` 作 fencing 令牌
+> **未采纳**，理由分别见 §3.1、§4.6、ADR-0022。
 >
 > **v0.6 变更**
 > 1. **纠错**：`@ca/engine-ai-sdk` 的 peerDependency 原写 `ai >= 5.0.0`，而 `ToolLoopAgent` /
@@ -34,7 +49,9 @@
    就自动获得崩溃恢复、effectively-once、预算治理、OTel 埋点。
 5. **诚实的能力边界**。不同引擎能力不同（如 sandbox 内执行的 harness 拦截不到工具），
    用 `EngineCapabilities` 显式建模并在启动时校验，不假装统一（§4.4）。
-6. **Conductor 对接**：`callback` 分片执行 + Journal + Fencing（§5、§6，v0.3 已对齐，本轮未改动）。
+6. **Conductor 对接**：`callback` 分片执行 + Journal + Fencing（§5、§6）。
+7. **一个任务只运行一个 agent**。并行、分支、审批、多 agent 协作全部用 Conductor 表达；
+   harness 引擎默认禁用子 agent 工具（[ADR-0025](adr/0025-single-agent-per-task.md)）。
 
 ### 1.2 非目标
 
@@ -44,7 +61,7 @@
 | 模型 provider 适配 | Agent SDK 的 provider 生态 |
 | MCP 客户端 | `@ai-sdk/mcp`（`createMCPClient` + stdio / Streamable HTTP） |
 | 统一消息格式 | 引擎自己的格式；core 只把它当作**不透明可序列化载荷**（§4.5） |
-| 自研 Conductor 客户端 / poll / 心跳 | 官方 `@io-orkes/conductor-javascript`（[ADR-0006](adr/0006-build-on-official-sdk.md)） |
+| 自研 Conductor 客户端 / poll | 官方 `@io-orkes/conductor-javascript@4.0.0`（[ADR-0006](adr/0006-build-on-official-sdk.md)）。两处例外：元数据注册走自有 REST（`nameCn`，ADR-0023）；分片内保活自持（ADR-0024） |
 | 编排引擎、向量库、训练评测平台 | Conductor 本身 / 用户自选 |
 
 ### 1.3 与官方 Conductor agents 层的关系
@@ -108,6 +125,23 @@ queueDAO.setUnackTimeout(DECIDER_QUEUE, workflowId, postponeDurationSeconds * 10
    把它调小以求"更快发现崩溃"会成比例加重 decider 负载：设成 10s，该工作流就每 11s 被扫一次；
    1000 个并发工作流即每秒多出约 90 次扫描。因此 §6.6 给它加了 **30s 下限**。
 
+### 2.3 契约实测（3.21.21 定制版，2026-09-29）
+
+> v0.7 新增。由 `tools/contract-verify` 在目标部署的测试环境上实测，每晚复核
+> （[ADR-0019](adr/0019-contract-verified-server-behavior.md)）。与 §2.2 冲突时以本节为准。
+
+| # | 实测结论 | 设计上的对策 |
+|---|---|---|
+| 1 | `IN_PROGRESS` 更新把队列消息推迟 `callbackAfterSeconds`；取 0 或小于心跳周期时，**同一 taskId** 每次心跳后都能被其他 worker 拉到（90s 内 22–23 次）；= `responseTimeoutSeconds` 时安全 | 任何 `IN_PROGRESS` 更新的 `callbackAfterSeconds` 不得小于保活间隔（§5.3） |
+| 2 | 每次重试生成新 taskId（`retriedTaskId` 指向上一次）；`FAILED_WITH_TERMINAL_ERROR` 不重试 | 与 §5.2 一致 |
+| 3 | 已超时任务上迟到的 `COMPLETED` **返回 200**，并把原记录从 `TIMED_OUT` 改写为 `COMPLETED`；工作流不采用 | 上报前归属检查（§6.2） |
+| 4 | output ≤ 1MB 内联；3–5MB 被服务端外部化；10MB 置为 `FAILED_WITH_TERMINAL_ERROR` **但返回 200** | `maxOutputBytes` 本地强制检查（§6.3） |
+| 5 | TaskDef / WorkflowDef **必填 `nameCn`**（定制字段） | §6.9 |
+| 6 | Task Log 可读写；TaskDef 持久化 `inputSchema` / `outputSchema`（是否校验未验证） | §10.4 不变 |
+
+**尚未实测**：`extendLease` 心跳（§2.2 的结论只来自源码）。`contract-verify` 需补这组实验，
+它决定 §5.3 保活的默认模式。
+
 ---
 
 ## 3. 总体架构
@@ -131,6 +165,13 @@ v0.3 的 core 自建了推理循环（`AgentStrategy`），因为「要写 journ
 | 工具执行 | 包装 `tool({ execute })` 的 `execute`；另有 `onToolExecutionStart/End` 回调 |
 
 于是 core 可以变得很薄：**它不写循环，它写拦截器。**
+
+> **为什么不用协作式上下文**（v0.7，对照 Projects 版）：另一种做法是给 agent 一个 `AgentContext`，
+> 由 agent 自己调用 `ctx.checkpoint.save()`、`ctx.budget.charge()`、`ctx.nextIdempotencyKey()`。
+> 它的保护取决于每个 agent 都记得调用、调用得对；漏一处，那一处就没有预算与幂等。
+> 拦截式把义务收敛为「调用走两个函数」一件事，且由引擎一致性套件验证（§11）。
+> 协作式上下文的各项能力在本设计中都有对应：checkpoint → Journal + `StateStore`，
+> budget → `BudgetGovernor`，幂等键 → `stepId`，progress → §10.4。
 
 ### 3.2 分层
 
@@ -483,7 +524,18 @@ interface ToolPolicy {
 未在 `toolPolicies` 中声明的工具默认按 `pure` 处理并发出运行时告警；
 `strictPolicies: true` 下拒绝注册未声明策略的工具。
 
+> **对照 Projects 版的 `defineTool`**（v0.7）：那一版自建了工具写法，按危险程度分
+> `readonly | mutating | destructive`，并附 `retry` / `cache` / `permission`。本设计不采纳自建写法（理由同上），
+> 但两套分类关注点不同、可以并存：`effect` 回答「重放是否安全」，危险程度回答「是否该放行」。
+> 后者由 `approval` 与 per-spec 允许清单（§9）承担。可吸收的两点：
+> 只读（`pure`）工具允许结果缓存；工具名建议带命名空间（如 `http.fetch`），便于按前缀配置策略。
+
 ### 4.7 挂起（HITL / 等待外部）：只走引擎原生审批
+
+> **v0.7：人工介入分两级**（[ADR-0021](adr/0021-two-level-hitl.md)）。本节描述的是**工具级**审批 ——
+> 循环中某次工具调用前停下、批完同一 run 续跑。**任务级**审批（agent 返回 `outcome: needs_approval`，
+> 任务 `COMPLETED`，由 workflow `SWITCH` 到 `HUMAN` 任务）对引擎零要求、在 Conductor 中完全可见，
+> **能放在任务边界的审批优先用任务级**。`suspend: 'none'` 的引擎同样可以用任务级。
 
 跨引擎的难点：**我们无法暂停别人的循环**。v0.4 曾设计两条路径，v0.5 只保留一条
 （[ADR-0014](adr/0014-native-approval-only-suspension.md)）。
@@ -581,6 +633,24 @@ runKey = `${workflowInstanceId}:${taskReferenceName}:${epoch}`
 `StateStore` 中 `runKey` 的租约记录带单调递增 `fenceToken`，journal 写入与 Conductor 回写都需携带，
 落后者被拒绝并自我放弃。
 
+> 不用 `retryCount` 作令牌（Projects 版的做法）：`callback` 下一分片可能被另一个 worker 拉到，
+> taskId 与 `retryCount` 都不变，区分不了两个 worker（[ADR-0022](adr/0022-ownership-check-and-local-verification.md)）。
+
+#### 分片内保活（v0.7）
+
+`SliceBudget` 是软预算，引擎只能在两次受管调用之间停下。一次模型调用或工具跑得比
+`responseTimeoutSeconds` 还久，任务就会被判超时 —— worker 其实活着。因此 `@ca/conductor`
+在**执行期间**运行一个保活定时器，分片交还或终态上报前停止（[ADR-0024](adr/0024-intra-slice-keepalive.md)）：
+
+| 参数 | 取值 | 依据 |
+|---|---|---|
+| 间隔 | `max(5s, responseTimeoutSeconds × 0.4)`，且 ≤ `callbackAfterSeconds × 0.4` | §2.3 #1 实测 |
+| 失败处理 | **连续 2 次失败 → `AbortSignal` 中止本次运行** | 赶在被他人接管前停下 |
+| 模式 | `extend-lease`（≥ 3.10.7 默认，不碰队列）/ `in-progress`（`callbackAfterSeconds = responseTimeoutSeconds`） | `extendLease` 待实测；未通过则默认改 `in-progress` |
+
+**不变量**：任何 `IN_PROGRESS` 更新的 `callbackAfterSeconds` 不得小于保活间隔，否则同一 taskId 会被重复投递（§2.3 #1）。
+不启用官方 `leaseExtendEnabled`：它的间隔是 0.8 倍、失败只记日志不中止，不满足 Fencing 的要求。
+
 > `callback` 与 `EngineTurn` 的 `continue` / `suspended` 是同一件事的两面：
 > 引擎交还一轮，桥接层就交还一个 Conductor 分片。这是契约设计的核心对齐点。
 
@@ -626,14 +696,25 @@ AI SDK 侧的翻译很自然：`stopWhen` 支持自定义谓词，且判定发�
 
 ---
 
-## 6. Conductor 桥接层（v0.3 已对齐，本轮未改动）
+## 6. Conductor 桥接层（v0.7 修订）
 
-要点回顾，细节见 v0.3 记录与 `packages/conductor/src/*`：
+要点回顾，细节见 `packages/conductor/src/*`：
 
 - **6.1 Worker 编译**：`AgentSpec` → 官方 `ConductorWorker`，交给官方 `TaskManager` 托管。
-- **6.2 状态映射**：完成 → `COMPLETED`；「做不到但流程该继续」→ `COMPLETED` + `ok:false`（走 SWITCH 分支）；
-  瞬时错误 → `FAILED`；终局错误 → `NonRetryableException`；分片未完 / 等待 → `IN_PROGRESS + callbackAfterSeconds`。
-- **6.3 Payload 治理**：`outputData` 默认 256KB 预算，transcript 始终外置到 `BlobStore`；
+  官方 SDK 锁定 `4.0.0`；网关鉴权通过 `createConductorClient(config, customFetch)` 的自定义 fetch 注入 header。
+- **6.2 状态映射**：完成（含业务信号）→ `COMPLETED` + `AgentTaskOutput`，按 `outcome` 走 SWITCH 分支（§6.8）；
+  失败 → `AgentTaskFailureOutput`，`error.retryable` 决定 `FAILED` 或 `FAILED_WITH_TERMINAL_ERROR`；
+  分片未完 / 等待 → `IN_PROGRESS + callbackAfterSeconds` + `AgentTaskInterimOutput`。
+  **v0.7 新增**：每次终态上报与分片交还前 `getTask` 做归属检查 —— 状态不是 `IN_PROGRESS` 或 `workerId`
+  不是自己时不上报，计入 `ca_stale_completion_total`（[ADR-0022](adr/0022-ownership-check-and-local-verification.md)）。
+
+  | 错误码 | 默认可重试 | | 错误码 | 默认可重试 |
+  |---|---|---|---|---|
+  | `MODEL_RATE_LIMIT` / `MODEL_UNAVAILABLE` | ✅ | | `INVALID_INPUT` | ❌ |
+  | `TOOL_FAILED` / `TIMEOUT` | ✅ | | `BUDGET_EXCEEDED` | ❌ |
+  | `INVALID_OUTPUT` / `INTERNAL` | ✅ | | `POLICY_DENIED` / `CANCELLED` / `FENCED` | ❌ |
+- **6.3 Payload 治理**：`outputData` 默认 256KB 预算（低于实测的 1MB 内联上限），**序列化后、上报前本地强制检查**，
+  不依赖服务端外部化、不以 HTTP 状态判断成功（§2.3 #4）；transcript 始终外置到 `BlobStore`；
   分片中间态放 `StateStore`，不塞 Conductor。
 - **6.4 CancellationWatcher**：轮询 workflow 状态 → `AbortSignal`（Conductor 不推送取消）。
 - **6.5 准入控制**：令牌预算反压动态调节官方 `TaskManager` 的 concurrency。
@@ -641,7 +722,44 @@ AI SDK 侧的翻译很自然：`stopWhen` 支持自定义谓词，且判定发�
   **v0.5 新增下限**：`responseTimeoutSeconds = max(30, ceil(sliceMs/1000 × 3))`。
   下限的理由是 §2.2 那条耦合——该值同时决定 Conductor 重扫这个工作流的频率，调小会成比例加重
   decider 负载。低于下限时 SDK 夹到 30s 并告警，而不是默默接受。
+  **v0.7 补充**：`responseTimeoutSeconds` 还须满足保活约束（≥ 13s，30s 下限已满足）且小于 `timeoutSeconds`；
+  `retryCount` 默认 2、`EXPONENTIAL_BACKOFF`、`retryDelaySeconds` 5；`inputKeys` / `outputKeys` 由信封字段生成；
+  `nameCn` 必填（§6.9）。
 - **6.7 Domain 路由**：透传官方 `domain`。
+- **6.8 出入参信封**（v0.7，[ADR-0020](adr/0020-io-envelope.md)）：
+
+  ```ts
+  interface AgentTaskInput<P> {          // 顶层未知字段拒绝
+    schemaVersion: '1';
+    payload: P;
+    instructions?: string;               // 追加在 spec 系统提示之后，不能替换
+    context?: { handoffs?: Handoff[]; artifacts?: ArtifactRef[] };
+    execution?: ExecutionOverrides;      // 与 spec.limits 合并，只能收紧
+    trace?: TraceContext;                // 进入 RunContext
+  }
+
+  interface AgentTaskOutput<R> {         // COMPLETED
+    schemaVersion: '1';
+    outcome: 'completed' | 'needs_approval' | 'needs_input' | 'escalated';
+    result?: R;                          // completed 时必填
+    summary: string;                     // 默认 ≤ 2000 字符
+    artifacts: ArtifactRef[];            // transcript 以 kind: 'transcript' 出现
+    request?: AgentTaskRequest;          // 非 completed 时必填
+    usage: Usage;
+    run: RunInfo;                        // engine / specHash / slices / attempt / resumed / stopReason …
+  }
+
+  interface AgentTaskFailureOutput { schemaVersion: '1'; error: AgentError; summary?: string; usage: Usage; run: RunInfo }
+  interface AgentTaskInterimOutput { schemaVersion: '1'; progress: ProgressReport }   // IN_PROGRESS
+  ```
+
+  `Handoff` 是 `AgentTaskOutput` 的结构子集，workflow 可把上游 output 直接映射为下游 `context.handoffs`。
+  引擎 `done.output` 若是含 `outcome` 的对象则按信封字段解释，否则视为 `{ outcome: 'completed', result: output }`。
+  类型与 zod schema 放在 `@ca/conductor/envelope`，`@ca/core` 保持零依赖。
+- **6.9 元数据与定制字段 `nameCn`**（v0.7，[ADR-0023](adr/0023-custom-name-cn-and-metadata-rest.md)）：
+  目标部署要求 TaskDef / WorkflowDef 必填 `nameCn`，官方 SDK 类型不含该字段。`@ca/conductor` 用自有类型
+  `CasTaskDef` / `CasWorkflowDef` 与窄 REST 实现 `MetadataApi` 注册元数据；`AgentSpec.conductor.nameCn` 必填，
+  对接未定制的 OSS 部署时可用 `requireNameCn: false` 关闭校验。
 
 ---
 
@@ -879,6 +997,9 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 | Spec | 合并语义快照测试；effective spec 的黄金文件 |
 | 进展 | 断言节流生效、单次 `addLog` ≤ 10 条、task log 索引关闭时自动降级且只告警一次、跨 `taskId` 重试后有续接摘要（§10.4） |
 | 集成 | docker-compose 起真实 Conductor OSS（3.21.x，另跑 3.10.6 验证版本探测降级） |
+| **契约**（v0.7） | `tools/contract-verify` 对目标部署的测试环境每晚运行：保活、重试 taskId、payload 阈值、`nameCn`、Task Log；失败自动建 issue（ADR-0019） |
+| 信封 | schema 快照测试；`schemaVersion` 变更必须附 changeset |
+| Mock 服务端 | `@ca/testing` 的 MockConductorServer 按 §2.3 建模：IN_PROGRESS 推迟消息、超时换新 taskId、迟到 COMPLETED 返回 200 但不推进工作流 |
 
 **引擎一致性套件是最重要的测试资产**：它把「支持任意 SDK」从口号变成可验证的契约。
 其中「声明的 capabilities 与实际行为一致」一项尤其关键——它防止适配器谎报能力导致用户误以为有保护。
@@ -904,13 +1025,14 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 .
 ├── docs/
 │   ├── architecture.md          ← 本文
-│   └── adr/                     ← 决策记录 0001-0013
+│   └── adr/                     ← 决策记录 0001-0025
 ├── packages/
 │   ├── core/                    @ca/core            薄契约层 + 可靠性内核
 │   ├── engine-ai-sdk/           AI SDK ToolLoopAgent 适配
 │   ├── engine-harness/          AI SDK HarnessAgent 适配（Claude Code / Codex / …）
 │   ├── engine-custom/           手写循环参考实现 + 契约基线
 │   ├── conductor/               官方 Conductor SDK 之上的薄桥接层
+│   │   └── src/envelope/        出入参信封（§6.8）；src/metadata/ 元数据 REST（§6.9）
 │   ├── memory/
 │   ├── observability/
 │   ├── testing/                 引擎一致性套件 + 崩溃/并发/分片注入
@@ -919,6 +1041,9 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 │   ├── minimal-agent/           ai-sdk/tool-loop + callback 分片
 │   ├── hitl-approval/           native-approval → Conductor callback 的同构映射
 │   └── domain-pack/             L1 领域包 + L2 实例 spec
+├── tools/
+│   └── contract-verify/         服务端契约实测（ADR-0019）
+├── .github/                     CI：pr / release / contract-nightly
 ├── pnpm-workspace.yaml
 └── tsconfig.base.json
 ```
@@ -929,7 +1054,7 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
-| **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + `@ca/engine-ai-sdk` + Conductor 桥接 + **进展反馈两通道（§10.4）** | `minimal-agent` 在 Conductor OSS 3.21.21 上端到端跑通，含跨分片恢复；运行中在 Conductor UI 能看到进度 |
+| **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + **分片内保活** + `@ca/engine-ai-sdk` + Conductor 桥接（信封、归属检查、`nameCn` 元数据）+ **进展反馈两通道（§10.4）** + `contract-verify` 每晚运行（含 `extendLease` 实验） | `minimal-agent` 在 3.21.21 定制版上端到端跑通，含跨分片恢复与单次长调用不超时；运行中在 Conductor UI 能看到进度 |
 | **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
 | **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效；定下长 turn 的处理方式（§15.3 第 1 条） |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
@@ -963,6 +1088,13 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | [0016](adr/0016-resume-decision-from-journal.md) | 用自己的 journal 终态区分崩溃与业务失败 | Accepted |
 | [0017](adr/0017-engine-contract-version.md) | 引擎契约版本与领域包兼容 | Accepted |
 | [0018](adr/0018-progress-reporting.md) | 进展反馈双通道：`outputData.progress` 权威 + Task Log 尽力而为 | Accepted |
+| [0019](adr/0019-contract-verified-server-behavior.md) | 服务端行为以契约实测为准，`contract-verify` 每晚复核 | Accepted |
+| [0020](adr/0020-io-envelope.md) | 统一出入参信封与 `outcome` 语义 | Accepted（取代 §6.2 的 `ok:false`） |
+| [0021](adr/0021-two-level-hitl.md) | 人工介入分两级：任务级 `outcome`，工具级原生审批 | Accepted（Amends 0014） |
+| [0022](adr/0022-ownership-check-and-local-verification.md) | 上报前归属检查，上报结果不以 HTTP 状态为准 | Accepted |
+| [0023](adr/0023-custom-name-cn-and-metadata-rest.md) | 定制必填字段 `nameCn`，元数据注册走自有 REST | Accepted（Amends 0006） |
+| [0024](adr/0024-intra-slice-keepalive.md) | 分片内保活 | Accepted（Amends 0006、0009） |
+| [0025](adr/0025-single-agent-per-task.md) | 一个任务只运行一个 agent，协作交给 Conductor | Accepted |
 
 ---
 
@@ -1007,3 +1139,12 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 3. **`callback` 分片的 journal 写放大与存储成本**。
    每个分片一次持久化，切得越碎写得越多。M2 压测中按 `sliceMs` 量化并给出选型表。
    先定默认 `sliceMs = 60s`，指标暴露**平均分片数/run**与**journal 字节数/run**（§10.2）。
+
+### 15.4 v0.7 合并引入的待验证项（4 条）
+
+| 问题 | 验证方法 | 影响 |
+|---|---|---|
+| `extendLease` 在 3.21.21 定制版上是否真的不触碰队列、能续约 | `contract-verify` 新增实验，对照 §2.3 #1 的四个变体 | §5.3 保活默认模式 |
+| 官方 SDK 4.0.0 注册 TaskDef 时是否保留 `nameCn` | 用 SDK 注册并读回 | 能否撤销 ADR-0023 的自有 REST |
+| TaskDef 的 `inputSchema` / `outputSchema` 是否被服务端实际校验 | 注册 schema 后用非法 input 启动工作流 | 信封校验能否部分交给服务端 |
+| 服务端外部化 input 时官方 SDK 是否自动下载 | 构造超过外部化阈值的 input | 大 `handoffs` 的传递方式 |

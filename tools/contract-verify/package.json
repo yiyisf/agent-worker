@@ -1,0 +1,19 @@
+{
+  "name": "@ca/contract-verify",
+  "version": "0.0.0",
+  "private": true,
+  "description": "在 Conductor 3.21.21（定制版）上验证 SDK 依赖的服务端行为：保活（含 extendLease）、重试 taskId、payload 阈值、nameCn 必填",
+  "type": "module",
+  "scripts": {
+    "verify": "tsx src/verify.ts",
+    "verify:sdk": "tsx src/sdk-smoke.ts",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src"
+  },
+  "dependencies": {
+    "@io-orkes/conductor-javascript": "4.0.0"
+  },
+  "optionalDependencies": {
+    "testcontainers": "^10.0.0"
+  }
+}

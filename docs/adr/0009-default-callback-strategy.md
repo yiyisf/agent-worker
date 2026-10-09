@@ -1,6 +1,6 @@
 # ADR-0009：默认租约策略选 `callback`
 
-- 状态：Accepted（改写 [ADR-0007](0007-lease-strategies-revised.md) 的默认值，不改其策略集合）
+- 状态：Accepted（改写 [ADR-0007](0007-lease-strategies-revised.md) 的默认值，不改其策略集合；分片内保活见 [ADR-0024](0024-intra-slice-keepalive.md)）
 - 日期：2026-09-05
 
 ## 背景：extendLease 的版本可用性

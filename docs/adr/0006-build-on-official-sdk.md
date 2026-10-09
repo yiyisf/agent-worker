@@ -1,6 +1,6 @@
 # ADR-0006：构建在官方 `@io-orkes/conductor-javascript` 之上
 
-- 状态：Accepted（Supersedes [ADR-0002](0002-own-rest-client.md)）
+- 状态：Accepted（Supersedes [ADR-0002](0002-own-rest-client.md)；元数据注册由 [ADR-0023](0023-custom-name-cn-and-metadata-rest.md)、心跳由 [ADR-0024](0024-intra-slice-keepalive.md) 修订）
 - 日期：2026-09-05
 
 ## 决策

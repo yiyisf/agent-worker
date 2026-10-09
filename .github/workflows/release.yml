@@ -1,0 +1,40 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # 需要维护者审批；私有 npm 仓库地址与 token 只存在于该 environment
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+          registry-url: ${{ vars.NPM_REGISTRY_URL }}
+          scope: '@ca'
+      - run: pnpm install --frozen-lockfile
+      # 有待发布的 changeset 时创建或更新“版本 PR”；版本 PR 合并后执行发布并打 tag
+      - uses: changesets/action@v1
+        with:
+          version: pnpm version-packages
+          publish: pnpm release
+          title: 'chore(repo): version packages'
+          commit: 'chore(repo): version packages'
+          createGithubReleases: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

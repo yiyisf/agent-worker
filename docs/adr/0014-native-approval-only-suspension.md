@@ -1,6 +1,6 @@
 # ADR-0014：挂起只走引擎原生审批，删除 `replay-signal`
 
-- 状态：Accepted（Amends [ADR-0012](0012-reliability-by-interception.md)）
+- 状态：Accepted（Amends [ADR-0012](0012-reliability-by-interception.md)；适用范围由 [ADR-0021](0021-two-level-hitl.md) 收窄为工具级审批）
 - 日期：2026-09-05
 
 ## 背景
