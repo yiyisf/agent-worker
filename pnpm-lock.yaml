@@ -89,6 +89,12 @@ importers:
         specifier: workspace:*
         version: link:../core
 
+  packages/engine-pi-durable:
+    dependencies:
+      '@ca/core':
+        specifier: workspace:*
+        version: link:../core
+
   packages/memory: {}
 
   packages/observability: {}

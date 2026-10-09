@@ -51,6 +51,13 @@ export interface EngineCapabilities {
   progress: 'step' | 'turn' | 'none';
   streaming: boolean;
   structuredOutput: boolean;
+  /**
+   * 引擎状态的并发约束（v0.7.1，ADR-0026），缺省 'fenced'：
+   * 'fenced'        状态在 StateStore 里，由 fenceToken 保护，任何 worker 都可接着跑（callback 分片可用）
+   * 'single-writer' 引擎自带持久化且无跨进程锁（如 Pi Durable），同一时刻只能有一个进程打开 →
+   *                 桥接层改用 lease-extend + 分片内保活，并要求 retryDelaySeconds ≥ responseTimeoutSeconds
+   */
+  stateOwnership?: 'fenced' | 'single-writer';
 }
 
 /**

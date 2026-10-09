@@ -76,6 +76,35 @@ describe('deriveTaskDef', () => {
   });
 });
 
+describe('deriveTaskDef：单写者引擎（ADR-0026）', () => {
+  const pi = (conductor: Record<string, unknown> = {}) => {
+    const s = spec({ engine: 'pi-durable' });
+    return { ...s, conductor: { ...s.conductor!, ...conductor } };
+  };
+
+  it('固定为 lease-extend，retryDelaySeconds 缺省取 responseTimeoutSeconds', () => {
+    const d = deriveTaskDef(pi(), { singleWriter: true });
+    expect(d.responseTimeoutSeconds).toBe(60);
+    expect(d.retryDelaySeconds).toBe(60);
+    expect(d.retryCount).toBeGreaterThanOrEqual(1);
+  });
+
+  it('显式 callback / hybrid 策略被拒绝', () => {
+    expect(() => deriveTaskDef(pi({ leaseStrategy: 'callback' }), { singleWriter: true })).toThrow(/单写者引擎不能用 callback/);
+    expect(() => deriveTaskDef(pi({ leaseStrategy: 'hybrid' }), { singleWriter: true })).toThrow(/hybrid/);
+    expect(deriveTaskDef(pi({ leaseStrategy: 'lease-extend' }), { singleWriter: true }).responseTimeoutSeconds).toBe(60);
+  });
+
+  it('retryDelaySeconds 小于 responseTimeoutSeconds 时拒绝', () => {
+    expect(() => deriveTaskDef(pi({ retry: { delaySeconds: 5 } }), { singleWriter: true })).toThrow(/retryDelaySeconds\(5\)/);
+    expect(deriveTaskDef(pi({ retry: { delaySeconds: 90 } }), { singleWriter: true }).retryDelaySeconds).toBe(90);
+  });
+
+  it('非单写者引擎不受影响', () => {
+    expect(deriveTaskDef(pi({ leaseStrategy: 'callback' })).retryDelaySeconds).toBe(5);
+  });
+});
+
 describe('diffTaskDefs', () => {
   it('报告缺失与字段漂移', () => {
     const local = deriveTaskDef(spec());

@@ -29,6 +29,7 @@ jobs:
             engine-ai-sdk
             engine-harness
             engine-custom
+            engine-pi-durable
             memory
             observability
             testing

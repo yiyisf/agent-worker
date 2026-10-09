@@ -9,7 +9,7 @@
 
 squash merge 以 PR 标题作为提交信息，标题需符合 Conventional Commits，例如 `feat(conductor): 分片内保活`。
 
-可用 scope：`core`、`conductor`、`engine-ai-sdk`、`engine-harness`、`engine-custom`、`memory`、`observability`、
+可用 scope：`core`、`conductor`、`engine-ai-sdk`、`engine-harness`、`engine-custom`、`engine-pi-durable`、`memory`、`observability`、
 `testing`、`cli`、`contract-verify`、`examples`、`docs`、`ci`、`repo`、`deps`。
 
 ## 本地检查

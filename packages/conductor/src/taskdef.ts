@@ -21,6 +21,12 @@
  *   2. retryCount 不可为 0 —— responseTimeout 超时会判 TIMED_OUT 并消耗一次重试配额
  *   3. timeoutPolicy 仅作用于 timeoutSeconds，对 responseTimeout 无效（该路径直接 timeoutTask()）
  *   4. 目标部署必填 nameCn（§2.3 #5，ADR-0023）
+ *
+ * 单写者引擎（capabilities.stateOwnership === 'single-writer'，如 Pi Durable，ADR-0026）：
+ * 引擎自带持久化且无跨进程锁，单写者由 Conductor 配置保证 ——
+ *   - 租约策略固定为 lease-extend：正常路径上不交还任务，不会被别的 worker 中途接走；
+ *   - 保活连续 2 次失败即 abort，最迟约 0.8 × responseTimeoutSeconds 停止，早于服务端重投；
+ *   - retryDelaySeconds ≥ responseTimeoutSeconds：新 taskId 再等一个间隔才可被拉到，给旧 worker 的 abort 留出余量。
  */
 import type { AgentSpec } from '@ca/core';
 import { ENVELOPE_INPUT_KEYS, ENVELOPE_OUTPUT_KEYS } from './envelope/schemas.js';
@@ -36,6 +42,8 @@ export interface DeriveTaskDefOptions {
   /** 缺省时使用 spec.conductor.ownerEmail */
   ownerEmail?: string;
   onWarning?: (message: string) => void;
+  /** 由引擎 capabilities.stateOwnership === 'single-writer' 推出（ADR-0026） */
+  singleWriter?: boolean;
 }
 
 export const DEFAULT_SLICE_MS = 60_000;
@@ -63,7 +71,12 @@ export function deriveTaskDef(spec: AgentSpec, opts: DeriveTaskDefOptions = {}):
   }
   const timeoutSeconds = Math.ceil((wallClockMs / 1000) * TIMEOUT_FACTOR);
 
-  const strategy = c.leaseStrategy ?? 'callback';
+  if (opts.singleWriter && c.leaseStrategy && c.leaseStrategy !== 'lease-extend') {
+    throw new Error(
+      `${taskType}: 单写者引擎不能用 ${c.leaseStrategy} 策略 —— 交还任务后下一片可能落到别的 worker，同时打开引擎存储（ADR-0026）`,
+    );
+  }
+  const strategy = opts.singleWriter ? 'lease-extend' : (c.leaseStrategy ?? 'callback');
   const derivedRt =
     strategy === 'callback'
       ? Math.max(MIN_RESPONSE_TIMEOUT_SECONDS, Math.ceil(((spec.limits?.sliceMs ?? DEFAULT_SLICE_MS) / 1000) * 3))
@@ -82,6 +95,13 @@ export function deriveTaskDef(spec: AgentSpec, opts: DeriveTaskDefOptions = {}):
     );
   }
 
+  const retryDelaySeconds = c.retry?.delaySeconds ?? (opts.singleWriter ? responseTimeoutSeconds : DEFAULT_RETRY.delaySeconds);
+  if (opts.singleWriter && retryDelaySeconds < responseTimeoutSeconds) {
+    throw new Error(
+      `${taskType}: 单写者引擎要求 retryDelaySeconds(${retryDelaySeconds}) ≥ responseTimeoutSeconds(${responseTimeoutSeconds})，给旧 worker 的 abort 留出余量（ADR-0026）`,
+    );
+  }
+
   const retryCount = c.retry?.count ?? DEFAULT_RETRY.count;
   if (!Number.isInteger(retryCount) || retryCount < 1) {
     throw new Error(`${taskType}: retryCount 不可为 0 —— responseTimeout 超时会消耗一次重试（§2.2）`);
@@ -94,7 +114,7 @@ export function deriveTaskDef(spec: AgentSpec, opts: DeriveTaskDefOptions = {}):
     ownerEmail,
     retryCount,
     retryLogic: c.retry?.logic ?? DEFAULT_RETRY.logic,
-    retryDelaySeconds: c.retry?.delaySeconds ?? DEFAULT_RETRY.delaySeconds,
+    retryDelaySeconds,
     timeoutSeconds,
     responseTimeoutSeconds,
     timeoutPolicy: 'RETRY',

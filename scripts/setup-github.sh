@@ -28,6 +28,7 @@ pkg:conductor|c5def5|@ca/conductor
 pkg:engine-ai-sdk|c5def5|@ca/engine-ai-sdk
 pkg:engine-harness|c5def5|@ca/engine-harness
 pkg:engine-custom|c5def5|@ca/engine-custom
+pkg:engine-pi-durable|c5def5|@ca/engine-pi-durable（实验 S1）
 pkg:memory|c5def5|@ca/memory
 pkg:observability|c5def5|@ca/observability
 pkg:testing|c5def5|@ca/testing
@@ -112,6 +113,9 @@ issue "MockConductorServer" "type:feat,pkg:testing" "按 architecture.md §2.3 �
 issue "Journal + StateStore(redis) + fenceToken" "type:feat,pkg:core,pkg:memory" "两个受管入口写 journal；条件写入以 fenceToken 为令牌，被拒写入抛 FencedOutError。"
 issue "AI SDK ToolLoopAgent 引擎适配" "type:feat,pkg:engine-ai-sdk" "wrapLanguageModel 中间件、tool.execute 包装、stopWhen 翻译 SliceBudget。"
 issue "minimal-agent 在 3.21.21 定制版上端到端跑通" "type:feat" "含跨分片恢复与单次长调用不超时；运行中在 Conductor UI 能看到进度（M1 出口标准）。"
+issue "[S1] Pi Durable 实验：单写者 Conductor 配置与 fencing 兜底" "type:spike,pkg:engine-pi-durable,pkg:conductor,risk:contract" "双 worker 竞争 + 中途杀进程 + 网络分区注入，验证 ADR-0026 的配置；统计 fencingStorage 拦截次数（architecture.md §15.5）。"
+issue "[S1] Pi Durable 实验：受管入口接入与能力假设验证" "type:spike,pkg:engine-pi-durable" "包装 models、wrapTool 覆盖内建工具、effectful 中断拦截；结论写回 architecture.md §4.4。"
+issue "[S1] Pi Durable 实验：PG 版 Storage" "type:spike,pkg:engine-pi-durable" "按 Pi Durable spec §10 存储契约实现，跑崩溃注入与吞吐测试。"
 issue "待确认：TaskDef schema 是否被服务端实际校验" "type:spike,risk:contract" "注册 schema 后用非法 input 启动工作流验证。"
 issue "待确认：外部化 input 时官方 SDK 是否自动下载" "type:spike,risk:contract" "构造超过外部化阈值的 input，观察 worker 收到的内容。"
 issue "决策：StateStore / BlobStore 选型与 TTL" "needs-decision" "Redis 或 PG；S3 或 MinIO。"
