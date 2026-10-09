@@ -1,8 +1,13 @@
 # Conductor AI Agent Worker SDK — 技术架构设计
 
-> 状态：Draft v0.7 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x（目标部署：3.21.21 定制版）
+> 状态：Draft v0.7.1 ｜ 语言：TypeScript (Node.js ≥ 20) ｜ 编排引擎：Conductor OSS ≥ 3.x（目标部署：3.21.21 定制版）
 > 上游 Agent SDK 基线：**`ai@7.0.93`**（v0.4–v0.5 的所有 AI SDK 结论均基于 v7 主干核实）
 > 官方 Conductor SDK：**`@io-orkes/conductor-javascript@4.0.0`**（锁定）
+>
+> **v0.7.1 变更：Pi Durable 实验引擎**（[ADR-0026](adr/0026-pi-durable-engine-spike.md)）
+> 新增实验包 `@ca/engine-pi-durable`，与 M1 并行（§13 实验 S1）。Pi Durable 没有跨进程锁，
+> 单写者由 Conductor 任务配置保证：每个 run 一份存储、`lease-extend` + 分片内保活、`retryDelaySeconds ≥ responseTimeoutSeconds`；
+> fencing 装饰器作兜底。顺带借鉴两点进核心设计：恢复时固定请求参数（§5.1）、journal 条目带版本与迁移（M2）。
 >
 > **v0.7 变更：与 Claude Projects 版设计（`ca-worker`）合并**
 > 1. **契约实测纳入设计**（§2.3，[ADR-0019](adr/0019-contract-verified-server-behavior.md)）：
@@ -256,6 +261,7 @@ graph TB
 | `@ca/engine-ai-sdk` | 适配 AI SDK `ToolLoopAgent`：模型中间件注入、工具包装、审批映射 | **新增** |
 | `@ca/engine-harness` | 适配 AI SDK `HarnessAgent`（Claude Code / Codex / Cursor / OpenCode / Pi 等） | **新增** |
 | `@ca/engine-custom` | 最小手写循环参考实现，兼作契约基线与一致性测试样本 | **新增** |
+| `@ca/engine-pi-durable` | **实验**（v0.7.1）：嵌入 Pi Durable harness 库，`state: 'engine-session'`，强制 `lease-extend`（ADR-0026） | **新增** |
 | `@ca/conductor` | 官方 SDK 之上的薄桥接层 | 不变 |
 | `@ca/memory` | `StateStore` / `BlobStore` / `MemoryStore` | 不变 |
 | `@ca/observability` | OTel GenAI span 与 Agent 语义指标 | 不变 |
@@ -471,6 +477,23 @@ harness 的工具有两个来源，拦截能力完全不同：
 一致性测试各取一个代表即可：**Pi**（host process）与 **Claude Code**（sandbox）。
 9 个里只有 **Codex 没有原生审批** → `suspend: 'none'`（§4.7）。
 
+#### Pi Durable：嵌入 harness 库的实验引擎（v0.7.1，[ADR-0026](adr/0026-pi-durable-engine-spike.md)）
+
+上表的 Pi 是经 AI SDK `HarnessAgent` 接入的 **Pi coding agent 进程**，模型调用归它所有，只能 `per-turn`。
+`@ca/engine-pi-durable` 则在 worker 进程内**直接嵌入** Pi Durable harness 库，扩展点多得多。
+以下为**待实验验证的假设**，结论出来后改写本表：
+
+| 能力 | 假设 | 依据 |
+|---|---|---|
+| `costVisibility` | `per-call` | harness 接受注入的 `models`，可包装每次请求（含恢复时的重发）；`beforeRequest` 抛错**不能**拦截，预算闸门须放在包装层 |
+| `toolInterception` | `all` | `wrapTool()` 装饰执行，`beforeTool` 可阻断；含 Pi coding agent 内建工具 |
+| `state` | `engine-session` | Pi 自己的检查点负责避免重复付费，journal 只存引用与 fence |
+| `sliceControl` / `suspend` | `none` / `none` | 无「步骤边界交还」接口、无原生两段式审批 → 强制 `lease-extend`；HITL 只走任务级 `outcome` |
+| `granularity` / `progress` | `step` / `step` | 每步检查点；conversation view 映射到 `ProgressReport` |
+
+Pi 的 `replay: "unsafe"`（缺省）会把「被中断」交给模型判断，与 ADR-0005 冲突；适配层须拦截并按
+`onAmbiguousReplay` 处理，不交给模型。
+
 #### 能力—配置一致性校验
 
 启动时校验，不满足则拒绝启动或显式降级并告警：
@@ -598,6 +621,8 @@ v0.4：**core 拦截两个入口**，在 `guard` 内写 journal。恢复时 `gua
 `stepId = sha256(runKey | seq | kind | 归一化输入)`：journal 主键 + 工具幂等键 + 模型响应缓存键。
 
 **对引擎的隐含要求**：给定相同输入与相同的 guard 返回值，循环走过的调用序列必须一致。
+**恢复时固定请求参数**（v0.7.1，借鉴 Pi Durable）：重放到尚无结果的那次模型调用时，必须用与原请求**相同的消息、模型、
+推理等级与流式选项**重发，不得按当前配置重新解析 —— 否则配置在两次尝试之间变化会让同一 `stepId` 对应两种请求。
 对 `ToolLoopAgent` 这类纯粹的「模型输出 → 工具 → 再问模型」循环天然成立；
 引擎若在循环里读时钟、掷随机数、或读外部状态，就会漂移——由引擎一致性测试（§10）暴露。
 
@@ -1025,12 +1050,13 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 .
 ├── docs/
 │   ├── architecture.md          ← 本文
-│   └── adr/                     ← 决策记录 0001-0025
+│   └── adr/                     ← 决策记录 0001-0026
 ├── packages/
 │   ├── core/                    @ca/core            薄契约层 + 可靠性内核
 │   ├── engine-ai-sdk/           AI SDK ToolLoopAgent 适配
 │   ├── engine-harness/          AI SDK HarnessAgent 适配（Claude Code / Codex / …）
 │   ├── engine-custom/           手写循环参考实现 + 契约基线
+│   ├── engine-pi-durable/       实验：嵌入 Pi Durable harness（ADR-0026）
 │   ├── conductor/               官方 Conductor SDK 之上的薄桥接层
 │   │   └── src/envelope/        出入参信封（§6.8）；src/metadata/ 元数据 REST（§6.9）
 │   ├── memory/
@@ -1055,7 +1081,8 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 | 里程碑 | 内容 | 出口标准 |
 |---|---|---|
 | **M1** 最小可用 | `@ca/core` 契约 + 两个受管入口 + Journal + StateStore(redis) + `callback` 租约 + **分片内保活** + `@ca/engine-ai-sdk` + Conductor 桥接（信封、归属检查、`nameCn` 元数据）+ **进展反馈两通道（§10.4）** + `contract-verify` 每晚运行（含 `extendLease` 实验） | `minimal-agent` 在 3.21.21 定制版上端到端跑通，含跨分片恢复与单次长调用不超时；运行中在 Conductor UI 能看到进度 |
-| **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
+| **S1** 实验（与 M1 并行） | `@ca/engine-pi-durable`：Conductor 单写者配置 + `deriveTaskDef` 校验 + 包装 `models` / `wrapTool` 接入受管入口 + `effectful` 中断拦截 + fencing 装饰器 + PG 版 Pi `Storage` | 见 ADR-0026 实验出口标准五条；结论写回 §4.4，评审决定转正、推迟或放弃 |
+| **M2** 可靠性 | Fencing + 错误分类 + 取消检测 + 崩溃/并发/分片三类测试 + **引擎一致性套件** + **journal 条目版本与迁移**（v0.7.1） | 三类测试全绿；一致性套件能抓出故意谎报 capabilities 的假引擎 |
 | **M3** 多引擎 | `@ca/engine-harness`（`per-turn` 预算闸门 + `host-declared-only` 工具保护）+ `@ca/engine-custom` + 能力校验 | 同一个 spec 换引擎跑通；`effectful` 声明在内建工具上被正确拒绝；轮间预算闸门生效；定下长 turn 的处理方式（§15.3 第 1 条） |
 | **M4** 配置化与领域定制 | `AgentSpec` 全量 + SpecLoader 三层合并 + Domain Pack 机制 + `ca spec diff/explain` | `domain-pack` 示例跑通；effective spec 可追溯 |
 | **M5** 生态与交互 | HITL（native-approval 全链路）、ConductorWorkflowTool、MCP 接线、StreamSink | `hitl-approval` 示例跑通 |
@@ -1063,6 +1090,10 @@ task log 挂在 `taskId` 上。`callback` 交还不换 `taskId`，所以分片�
 
 M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 先用一个真实引擎把契约打磨对，再谈通用——反过来做必然设计出架空的抽象。
+
+**S1 不违背这一条**：它是验证适配度的实验，不进入 M1 的交付范围，也不反向改动 `AgentEngine` 契约；
+若实验暴露出契约必须改的地方，记录为 M3 的输入。它的收益恰好是 M1 缺的：
+一个自带持久化、`state: 'engine-session'` 的真实引擎，能早早检验 journal 与引擎会话并存时的边界。
 
 ---
 
@@ -1095,6 +1126,7 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | [0023](adr/0023-custom-name-cn-and-metadata-rest.md) | 定制必填字段 `nameCn`，元数据注册走自有 REST | Accepted（Amends 0006） |
 | [0024](adr/0024-intra-slice-keepalive.md) | 分片内保活 | Accepted（Amends 0006、0009） |
 | [0025](adr/0025-single-agent-per-task.md) | 一个任务只运行一个 agent，协作交给 Conductor | Accepted |
+| [0026](adr/0026-pi-durable-engine-spike.md) | 引入 Pi Durable 作为实验引擎，单写者由 Conductor 任务配置保证 | Accepted（实验） |
 
 ---
 
@@ -1148,3 +1180,13 @@ M1 只做一个引擎（AI SDK ToolLoopAgent）。**多引擎推迟到 M3**：
 | 官方 SDK 4.0.0 注册 TaskDef 时是否保留 `nameCn` | 用 SDK 注册并读回 | 能否撤销 ADR-0023 的自有 REST |
 | TaskDef 的 `inputSchema` / `outputSchema` 是否被服务端实际校验 | 注册 schema 后用非法 input 启动工作流 | 信封校验能否部分交给服务端 |
 | 服务端外部化 input 时官方 SDK 是否自动下载 | 构造超过外部化阈值的 input | 大 `handoffs` 的传递方式 |
+
+### 15.5 实验 S1（Pi Durable）待验证项（5 条）
+
+| 问题 | 验证方法 | 影响 |
+|---|---|---|
+| Conductor 配置能否保证单写者 | 双 worker 竞争 + 工具执行中途杀进程 + 网络分区注入，统计 fencing 装饰器拦截次数 | 兜底装饰器是否必须常开 |
+| 包装注入的 `models` 能否覆盖全部模型调用（含恢复重发、压缩摘要请求） | 计数对账：受管入口次数 = provider 侧请求次数 | `costVisibility` 能否定为 `per-call` |
+| `wrapTool` 能否包住 Pi coding agent 内建工具 | 内建 read / write / edit / bash 全部经 `ManagedToolGateway` | `toolInterception` 能否定为 `all` |
+| `replay: "unsafe"` 中断能否在交给模型前拦截 | 在 `effectful` 工具执行中杀进程，确认 run 按 `onAmbiguousReplay` 失败而非由模型重试 | ADR-0005 在此引擎上能否成立 |
+| PG 版 Pi `Storage` 的实现成本与性能 | 按 spec §10 存储契约实现，跑崩溃注入与吞吐测试 | 实验能否转正 |

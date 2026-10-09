@@ -54,6 +54,7 @@ const tools = mapValues(userTools, (t, name) => ({
 | `@ca/engine-ai-sdk` | AI SDK `ToolLoopAgent`（`stopWhen` / `prepareStep` / `toolApproval` / provider 生态 / `@ai-sdk/mcp`） |
 | `@ca/engine-harness` | AI SDK `HarnessAgent` → Claude Code / Cline / Codex / Cursor / Deep Agents / fx / Grok Build / OpenCode / Pi |
 | `@ca/engine-custom` | 最小手写循环参考实现，兼作一致性测试基线 |
+| `@ca/engine-pi-durable` | **实验**：嵌入 Pi Durable harness，单写者由 Conductor 配置保证（[ADR-0026](docs/adr/0026-pi-durable-engine-spike.md)） |
 
 **`EngineCapabilities` 显式建模能力差异，不假装统一。** 两个关键分级：
 
@@ -114,13 +115,13 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 | [§10.4 进展反馈](docs/architecture.md#104-进展反馈让编排引擎在运行中就知道进度) | 运行中的进展同步回编排引擎（不是实时输出流） |
 | [§6.8 出入参信封](docs/architecture.md#6-conductor-桥接层v07-修订) | 任务间交接格式与 `outcome` 语义 |
 | [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条、v0.7 待验证 4 条 |
-| [docs/adr/](docs/adr/) | 25 条决策记录 |
+| [docs/adr/](docs/adr/) | 26 条决策记录 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 分支、提交、评审、分层依赖规范 |
 
 ## 仓库结构
 
 ```
-packages/  core / engine-ai-sdk / engine-harness / engine-custom
+packages/  core / engine-ai-sdk / engine-harness / engine-custom / engine-pi-durable（实验）
            conductor / memory / observability / testing / cli
 examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
 tools/     contract-verify（服务端契约实测）
@@ -140,6 +141,7 @@ CONDUCTOR_URL=http://<host>:<port>/api pnpm verify:contract   # 只对非生产�
 ## 路线图
 
 **M1** 最小可用（core 契约 + 受管入口 + journal + callback + engine-ai-sdk，跑通 3.21.21）
+（并行：**S1** Pi Durable 实验引擎，ADR-0026）
 → **M2** 可靠性（fencing + 三类测试 + **引擎一致性套件**）
 → **M3** 多引擎（harness 能力降级 + custom + 能力校验）
 → **M4** 配置化与领域定制 → **M5** HITL 与生态 → **M6** 生产化
