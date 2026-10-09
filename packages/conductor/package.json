@@ -10,21 +10,34 @@
   ],
   "sideEffects": false,
   "scripts": {
-    "build": "tsup src/index.ts --format esm,cjs --dts --clean --sourcemap --target node20",
+    "build": "tsup src/index.ts src/envelope/index.ts --format esm,cjs --dts --clean --sourcemap --target node20",
     "typecheck": "tsc --noEmit",
-    "lint": "eslint src",
-    "test": "vitest run --passWithNoTests"
+    "lint": "eslint src test",
+    "test": "vitest run --coverage"
   },
   "peerDependencies": {
     "@io-orkes/conductor-javascript": "4.0.0"
   },
   "dependencies": {
-    "@ca/core": "workspace:*"
+    "@ca/core": "workspace:*",
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@io-orkes/conductor-javascript": "4.0.0"
   },
   "publishConfig": {
     "access": "restricted"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./envelope": {
+      "types": "./dist/envelope/index.d.ts",
+      "import": "./dist/envelope/index.js",
+      "require": "./dist/envelope/index.cjs"
+    }
   }
 }

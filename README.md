@@ -8,7 +8,7 @@
 - **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
 - **当前状态**：M0→M1，架构设计 v0.7（已与 Claude Projects 版 `ca-worker` 合并）。
-  代码为契约声明，尚无实现。
+  `@ca/conductor` 的信封、错误映射、保活参数、TaskDef 推导、元数据 REST（`nameCn`）已实现并有单测；其余仍为契约声明。
 - **目标部署**：Conductor OSS 3.21.21 定制版（TaskDef / WorkflowDef 必填 `nameCn`）；官方 SDK 锁定 `@io-orkes/conductor-javascript@4.0.0`
 
 ## 这个 SDK 做什么、不做什么

@@ -36,6 +36,8 @@ Projects 版设计了一套完整信封并已实现、有单测，本 ADR 采纳
 
 - `run.framework` → `run.engine`（AgentEngine id）；新增 `run.specHash`（§7.2）、`run.slices`；
   `resumedFromCheckpoint` → `resumed`（journal 重放）；`compactions` 改为可选（拦截式架构下 core 不一定知道）。
+- `Usage.cachedTokens` → `cachedInputTokens`，与 `@ca/core` 的 `Usage` 对齐。
+- 错误码新增 `FENCED`（不可重试，ADR-0022）。
 - transcript 用 `artifacts` 中 `kind: 'transcript'` 的 `ArtifactRef` 表达，不另设字段。
 - `AgentTaskInterimOutput` 是新增形状：`{ schemaVersion, progress }`，即 ADR-0018 的权威进展通道。
 

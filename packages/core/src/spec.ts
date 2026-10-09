@@ -48,7 +48,18 @@ export type LeaseStrategy = 'callback' | 'lease-extend' | 'hybrid';
 export type ResumePolicy = 'on-lease-loss' | 'fresh-per-retry' | 'never';
 
 export interface ConductorTaskOptions {
+  /** = TaskDef name，只能包含字母、数字、下划线 */
   taskType: string;
+  /** 目标部署（3.21.21 定制版）必填的中文名（ADR-0023） */
+  nameCn?: string;
+  ownerEmail?: string;
+  description?: string;
+  /** retryCount 不可为 0；默认 2 次、EXPONENTIAL_BACKOFF、间隔 5s（§6.6） */
+  retry?: { count?: number; logic?: 'FIXED' | 'EXPONENTIAL_BACKOFF' | 'LINEAR_BACKOFF'; delaySeconds?: number };
+  /** 显式覆盖推导值；低于 30s 下限时夹到 30s 并告警（§6.6） */
+  responseTimeoutSeconds?: number;
+  concurrentExecLimit?: number;
+  rateLimit?: { perFrequency: number; frequencyInSeconds: number };
   domain?: string;
   leaseStrategy: LeaseStrategy;
   resumePolicy: ResumePolicy;
