@@ -7,7 +7,9 @@
 - **执行模式**：Worker 内闭环 —— 一个 Conductor task = 一次完整 Agent 运行，循环跑在 **worker 进程内**
 - **Agent 能力**：**不自建**。由外部 Agent SDK 提供（基线 [`ai@7.x`](https://github.com/vercel/ai)），本 SDK 通过 `AgentEngine` 适配
 - **默认租约**：`callback` 分片执行（Conductor 3.x 全系可用）
-- **当前状态**：M0，架构设计与目录骨架（v0.4）。代码为契约声明，尚无实现。
+- **当前状态**：M0→M1，架构设计 v0.7（已与 Claude Projects 版 `ca-worker` 合并）。
+  代码为契约声明，尚无实现。
+- **目标部署**：Conductor OSS 3.21.21 定制版（TaskDef / WorkflowDef 必填 `nameCn`）；官方 SDK 锁定 `@io-orkes/conductor-javascript@4.0.0`
 
 ## 这个 SDK 做什么、不做什么
 
@@ -85,7 +87,7 @@ L0 通用默认 → L1 领域包（`@acme/ca-pack-<domain>`：工具、策略、
 → L2 实例 spec，逐层覆盖。合并结果输出 **effective spec 快照**写入 journal 与 `outputData`，
 使「这次运行到底用的什么配置」可追溯（[ADR-0013](docs/adr/0013-agent-spec-and-domain-packs.md)）。
 
-## Conductor 对接（v0.3 已对齐）
+## Conductor 对接
 
 | 能力 | 最低版本 |
 |---|---|
@@ -94,6 +96,9 @@ L0 通用默认 → L1 领域包（`@acme/ca-pack-<domain>`：工具、策略、
 
 服务端租约/超时的精确语义见 [architecture.md §2.2](docs/architecture.md#22-服务端语义v32121-源码核实结论)，
 三条容易踩的坑：`retryCount` 不可为 0、`timeoutSeconds` 必须覆盖所有等待时间、`timeoutPolicy` 对 responseTimeout 无效。
+
+目标部署上的**契约实测结论**见 [§2.3](docs/architecture.md#23-契约实测32121-定制版2026-09-29)，由 `tools/contract-verify` 每晚复核。
+两条最反直觉：迟到的 `COMPLETED` 与 10MB output 都返回 HTTP 200 —— 上报结果不能以 HTTP 状态为准（[ADR-0022](docs/adr/0022-ownership-check-and-local-verification.md)）。
 
 **`EngineTurn` 与 Conductor 分片天然同构**：引擎交还一轮 = 桥接层交还一个分片。
 AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要任何 hack。
@@ -107,8 +112,10 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 | [§4.4 能力边界](docs/architecture.md#44-enginecapabilities--诚实的能力边界) | 不同引擎的能力差异与校验 |
 | [§7 配置化与领域定制](docs/architecture.md#7-配置化与领域定制) | L0/L1/L2、SpecLoader、引擎契约版本 |
 | [§10.4 进展反馈](docs/architecture.md#104-进展反馈让编排引擎在运行中就知道进度) | 运行中的进展同步回编排引擎（不是实时输出流） |
-| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条 |
-| [docs/adr/](docs/adr/) | 18 条决策记录（含 3 条被后续推翻、2 条被修订的） |
+| [§6.8 出入参信封](docs/architecture.md#6-conductor-桥接层v07-修订) | 任务间交接格式与 `outcome` 语义 |
+| [§15 遗留问题](docs/architecture.md#15-遗留问题) | 已关闭 7 条、已定方案 2 条、仍开放 3 条、v0.7 待验证 4 条 |
+| [docs/adr/](docs/adr/) | 25 条决策记录 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 分支、提交、评审、分层依赖规范 |
 
 ## 仓库结构
 
@@ -116,6 +123,18 @@ AI SDK 的两段式 tool approval 正好落在这个边界上，HITL 不需要�
 packages/  core / engine-ai-sdk / engine-harness / engine-custom
            conductor / memory / observability / testing / cli
 examples/  minimal-agent (M1) / hitl-approval (M5) / domain-pack (M4)
+tools/     contract-verify（服务端契约实测）
+```
+
+## 开发
+
+需要 Node.js ≥ 20 与 pnpm 9（`corepack enable`）。
+
+```bash
+pnpm install
+pnpm lint && pnpm typecheck && pnpm test && pnpm build
+pnpm changeset                                            # 修改对外发布的包时
+CONDUCTOR_URL=http://<host>:<port>/api pnpm verify:contract   # 只对非生产环境
 ```
 
 ## 路线图
